@@ -2,6 +2,7 @@
 
 import org.example.DeploymentManager
 import org.example.BlueGreenDeployment
+import org.example.NotificationManager
 
 pipeline {
     agent any
@@ -16,14 +17,27 @@ pipeline {
         booleanParam(name: 'ROLLBACK',
                      defaultValue: false,
                      description: 'Rollback?')
+        string(name: 'RECIPIENTS',
+               defaultValue: 'YOUR_EMAIL@gmail.com',
+               description: 'Email recipients')
     }
 
     environment {
         SERVICE    = 'attendance'
         KUBECONFIG = '/var/lib/jenkins/.kube/config'
+        BRANCH     = "${env.GIT_BRANCH ?: 'master'}"
     }
 
     stages {
+
+        stage('Notify Start') {
+            steps {
+                script {
+                    def nm = new NotificationManager(this)
+                    nm.notifyAll('STARTED', buildDetails())
+                }
+            }
+        }
 
         stage('Validate') {
             when { expression { !params.ROLLBACK } }
@@ -36,7 +50,17 @@ pipeline {
         }
 
         stage('Deploy') {
-            when { expression { !params.ROLLBACK } }
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    anyOf {
+                        branch 'master'
+                        branch 'main'
+                        branch 'staging'
+                        expression { params.ENVIRONMENT == 'staging' }
+                    }
+                }
+            }
             steps {
                 script {
                     def dm = new DeploymentManager(this)
@@ -66,11 +90,72 @@ pipeline {
     }
 
     post {
-        success {
-            echo "SUCCESS: ${SERVICE} v${params.VERSION} deployed to ${params.ENVIRONMENT}"
+
+        always {
+            echo "=== POST: ALWAYS ==="
+            echo "Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+            echo "Duration: ${currentBuild.durationString}"
+            echo "Status: ${currentBuild.currentResult}"
         }
+
+        success {
+            echo "=== POST: SUCCESS ==="
+            script {
+                // Sirf master/main branch pe full notification
+                if (env.BRANCH ==~ /master|main|staging/) {
+                    def nm = new NotificationManager(this)
+                    nm.notifyAll('SUCCESS', buildDetails())
+                } else {
+                    echo "Feature branch — skipping full notification"
+                    def nm = new NotificationManager(this)
+                    nm.sendEmail('SUCCESS', buildDetails())
+                }
+            }
+        }
+
         failure {
-            echo "FAILED: Check logs"
+            echo "=== POST: FAILURE ==="
+            script {
+                def nm = new NotificationManager(this)
+                // Failure pe sabko notify karo — har branch pe
+                nm.notifyAll('FAILURE', buildDetails())
+            }
+        }
+
+        unstable {
+            echo "=== POST: UNSTABLE ==="
+            script {
+                def nm = new NotificationManager(this)
+                nm.notifyAll('UNSTABLE', buildDetails())
+            }
         }
     }
+}
+
+// ── Helper: Build Details Map ──────────────────────────────────
+def buildDetails() {
+    // Changes collect karo
+    def changesList = []
+    try {
+        currentBuild.changeSets.each { changeSet ->
+            changeSet.items.each { item ->
+                changesList << "${item.author}: ${item.msg}"
+            }
+        }
+    } catch (e) {
+        changesList << 'No changes info available'
+    }
+
+    return [
+        jobName    : env.JOB_NAME,
+        buildNumber: env.BUILD_NUMBER,
+        branch     : env.BRANCH ?: env.GIT_BRANCH ?: 'master',
+        service    : SERVICE,
+        version    : params.VERSION,
+        environment: params.ENVIRONMENT,
+        duration   : currentBuild.durationString ?: 'N/A',
+        changes    : changesList.isEmpty() ? 'No changes' : changesList.join(' | '),
+        buildUrl   : env.BUILD_URL,
+        recipients : params.RECIPIENTS
+    ]
 }
