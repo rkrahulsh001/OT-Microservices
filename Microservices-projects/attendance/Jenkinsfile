@@ -171,10 +171,17 @@ pipeline {
             steps {
                 dir("${TEST_DIR}") {
                     sh """
+                        echo "=== Files before PDF generation ==="
+                        ls -la *.xml *.log *.txt 2>/dev/null || true
+
                         export VERSION=${params.VERSION}
                         export ENVIRONMENT=${params.ENVIRONMENT}
                         export GIT_BRANCH=${env.BRANCH}
+                        export BUILD_NUMBER=${env.BUILD_NUMBER}
+
                         python3 generate_report.py
+
+                        echo "=== PDF Info ==="
                         ls -la test-report.pdf
                     """
                 }
@@ -197,7 +204,8 @@ pipeline {
                                        "${TEST_DIR}/*.xml," +
                                        "${TEST_DIR}/*.log," +
                                        "${TEST_DIR}/*.txt",
-                    allowEmptyArchive: true
+                    allowEmptyArchive: true,
+                    fingerprint      : true
                 )
             }
         }

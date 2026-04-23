@@ -3,6 +3,7 @@ import xml.etree.ElementTree as ET
 import datetime
 import os
 
+
 class ReportPDF(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 16)
@@ -20,13 +21,19 @@ class ReportPDF(FPDF):
             f'Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M")} | Page {self.page_no()}',
             0, 0, 'C')
 
+
 def parse_xml(xml_file):
-    if not os.path.exists(xml_file):
+    abs_path = os.path.abspath(xml_file)
+    print(f"Looking for XML: {abs_path}")
+    if not os.path.exists(abs_path):
+        print(f"WARNING: File not found: {abs_path}")
         return None
-    tree  = ET.parse(xml_file)
+    print(f"Found XML: {abs_path} ({os.path.getsize(abs_path)} bytes)")
+    tree  = ET.parse(abs_path)
     root  = tree.getroot()
     suite = root if root.tag == 'testsuite' else root.find('testsuite')
     if suite is None:
+        print(f"WARNING: No testsuite element in {abs_path}")
         return None
     tests    = int(suite.get('tests',    0))
     failures = int(suite.get('failures', 0))
@@ -41,13 +48,24 @@ def parse_xml(xml_file):
         'time'    : float(suite.get('time', 0))
     }
 
+
 def get_coverage(cov_file):
-    if not os.path.exists(cov_file):
+    abs_path = os.path.abspath(cov_file)
+    print(f"Looking for coverage: {abs_path}")
+    if not os.path.exists(abs_path):
+        print(f"WARNING: Coverage file not found: {abs_path}")
         return None
-    root = ET.parse(cov_file).getroot()
+    print(f"Found coverage: {abs_path} ({os.path.getsize(abs_path)} bytes)")
+    root = ET.parse(abs_path).getroot()
     return round(float(root.get('line-rate', 0)) * 100, 2)
 
+
 def generate():
+    # Debug info
+    cwd = os.getcwd()
+    print(f"Working directory: {cwd}")
+    print(f"Files present: {sorted(os.listdir(cwd))}")
+
     pdf = ReportPDF()
     pdf.add_page()
 
@@ -57,16 +75,17 @@ def generate():
     pdf.cell(0, 10, 'Build Information', 0, 1, 'L', True)
     pdf.set_font('Arial', '', 10)
     for label, value in [
-        ('Service',     'attendance'),
-        ('Version',     os.getenv('VERSION',     '1.0.0')),
-        ('Environment', os.getenv('ENVIRONMENT', 'staging')),
-        ('Branch',      os.getenv('GIT_BRANCH',  'master').replace('origin/', '')),
-        ('Date',        datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+        ('Service',      'attendance'),
+        ('Version',      os.getenv('VERSION',      '1.0.0')),
+        ('Environment',  os.getenv('ENVIRONMENT',  'staging')),
+        ('Branch',       os.getenv('GIT_BRANCH',   'master').replace('origin/', '')),
+        ('Build Number', os.getenv('BUILD_NUMBER', 'N/A')),
+        ('Date',         datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
     ]:
         pdf.set_font('Arial', 'B', 10)
         pdf.cell(50, 8, f'{label}:', 0, 0)
         pdf.set_font('Arial', '', 10)
-        pdf.cell(0,  8, str(value), 0, 1)
+        pdf.cell(0, 8, str(value), 0, 1)
     pdf.ln(5)
 
     # Test Results Table
@@ -111,7 +130,7 @@ def generate():
             total_p += d['passed']
             total_f += d['failures']
         else:
-            for v, w in zip([name,'-','-','-','-','-','N/A'], widths):
+            for v, w in zip([name, '-', '-', '-', '-', '-', 'N/A'], widths):
                 pdf.cell(w, 7, v, 1, 0, 'C', True)
             pdf.ln()
     pdf.ln(5)
@@ -136,7 +155,7 @@ def generate():
         pdf.cell(0, 10, 'Coverage data not available', 0, 1, 'C')
     pdf.ln(5)
 
-    # Overall
+    # Overall Summary
     pdf.set_font('Arial', 'B', 12)
     pdf.set_fill_color(236, 240, 241)
     pdf.cell(0, 10, 'Overall Summary', 0, 1, 'L', True)
@@ -153,8 +172,13 @@ def generate():
         f'Total: {total_t} | Passed: {total_p} | Failed: {total_f}',
         0, 1, 'C')
 
-    pdf.output('test-report.pdf')
-    print('PDF generated: test-report.pdf')
+    out = 'test-report.pdf'
+    pdf.output(out)
+    size = os.path.getsize(out)
+    print(f'PDF generated: {out} ({size} bytes)')
+    if size < 5000:
+        print('WARNING: PDF is very small — XML/coverage files may be missing!')
+
 
 if __name__ == '__main__':
     generate()
