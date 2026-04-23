@@ -61,7 +61,12 @@ def get_coverage(cov_file):
 
 
 def generate():
+    # Fix: script ki apni directory mein chale jao
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(script_dir)
+
     # Debug info
+
     cwd = os.getcwd()
     print(f"Working directory: {cwd}")
     print(f"Files present: {sorted(os.listdir(cwd))}")
