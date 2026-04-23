@@ -34,7 +34,8 @@ pipeline {
             steps {
                 script {
                     def nm = new NotificationManager(this)
-                    nm.notifyAll('STARTED', buildDetails())
+                    nm.sendSlack('STARTED', buildDetails())
+                    nm.sendTeams('STARTED', buildDetails())
                 }
             }
         }
