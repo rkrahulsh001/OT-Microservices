@@ -91,7 +91,7 @@ class NotificationManager implements Serializable {
     // ── PRIVATE — MESSAGE BUILDERS ────────────────────────────
 
     private String buildSlackMessage(String status, String emoji, Map d) {
-        String buildUrl   = d.buildUrl ?: ''
+        String buildUrl   = (d.buildUrl ?: '').replaceAll('/?$', '/')
         String quickLinks = ''
 
         // Quick Links sirf SUCCESS/FAILURE/UNSTABLE pe dikhao, STARTED pe nahi
