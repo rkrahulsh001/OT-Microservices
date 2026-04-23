@@ -1,6 +1,12 @@
 import pytest
 import json
+import os
 from unittest.mock import patch, MagicMock
+
+# CONFIG_FILE env set karo import se pehle
+os.environ['CONFIG_FILE'] = os.path.join(
+    os.path.dirname(__file__), 'config.yaml')
+
 from attendance_api import app
 
 @pytest.fixture
@@ -9,19 +15,16 @@ def client():
     with app.test_client() as client:
         yield client
 
-# Test 1: Index route 404
 def test_index_route(client):
     response = client.get('/')
     assert response.status_code == 404
 
-# Test 2: Health - MySQL down
 @pytest.mark.get_health
 def test_health_mysql_down(client):
     response = client.get('/attendance/healthz')
     data = json.loads(response.data.decode('utf-8'))
     assert data.get("description") in ["MySQL is healthy", "MySQL is not healthy"]
 
-# Test 3: Health - MySQL up (mocked)
 @pytest.mark.get_health
 @patch('attendance_api.create_mysql_client')
 def test_health_mysql_up(mock_mysql, client):
@@ -33,14 +36,12 @@ def test_health_mysql_up(mock_mysql, client):
     assert response.status_code == 200
     assert data.get("description") == "MySQL is healthy"
 
-# Test 4: Search - no MySQL
 @pytest.mark.get_request
 def test_search_no_mysql(client):
     response = client.get('/attendance/search')
     data = json.loads(response.data.decode('utf-8'))
     assert data.get("message") == "Error while pulling data for attendance"
 
-# Test 5: Search - mocked MySQL
 @pytest.mark.get_request
 @patch('attendance_api.create_mysql_client')
 def test_search_with_data(mock_mysql, client):
@@ -52,7 +53,6 @@ def test_search_with_data(mock_mysql, client):
     response = client.get('/attendance/search')
     assert response.status_code == 200
 
-# Test 6: Create - mocked MySQL
 @patch('attendance_api.create_mysql_client')
 def test_create_attendance(mock_mysql, client):
     mock_conn = MagicMock()
