@@ -1,0 +1,76 @@
+@Library('jenkins-shared-library') _
+
+import org.example.DeploymentManager
+import org.example.BlueGreenDeployment
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'VERSION',
+               defaultValue: '1.0.0',
+               description: 'Image version')
+        choice(name: 'ENVIRONMENT',
+               choices: ['staging', 'dev', 'prod'],
+               description: 'Target environment')
+        booleanParam(name: 'ROLLBACK',
+                     defaultValue: false,
+                     description: 'Rollback?')
+    }
+
+    environment {
+        SERVICE    = 'attendance'
+        KUBECONFIG = '/var/lib/jenkins/.kube/config'
+    }
+
+    stages {
+
+        stage('Validate') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    def dm = new DeploymentManager(this)
+                    dm.validateConfig(SERVICE, params.ENVIRONMENT, params.VERSION)
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    def dm = new DeploymentManager(this)
+                    dm.deploy(SERVICE, params.ENVIRONMENT, params.VERSION)
+                }
+            }
+        }
+
+        stage('Rollback') {
+            when { expression { params.ROLLBACK } }
+            steps {
+                script {
+                    def dm = new DeploymentManager(this)
+                    dm.rollback(SERVICE, params.ENVIRONMENT)
+                }
+            }
+        }
+
+        stage('Final Status') {
+            steps {
+                script {
+                    def bg = new BlueGreenDeployment(this)
+                    bg.finalStatus(SERVICE, params.ENVIRONMENT)
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "SUCCESS: ${SERVICE} v${params.VERSION} deployed to ${params.ENVIRONMENT}"
+        }
+        failure {
+            echo "FAILED: Check logs"
+        }
+    }
+}
