@@ -18,14 +18,14 @@ pipeline {
                      defaultValue: false,
                      description: 'Rollback?')
         string(name: 'RECIPIENTS',
-               defaultValue: 'YOUR_EMAIL@gmail.com',
+               defaultValue: 'rkrahulsh001@gmail.com',
                description: 'Email recipients')
     }
 
     environment {
         SERVICE    = 'attendance'
         KUBECONFIG = '/var/lib/jenkins/.kube/config'
-        BRANCH     = "${env.GIT_BRANCH ?: 'master'}"
+        BRANCH     = "${env.GIT_BRANCH?.replaceAll('origin/', '') ?: 'master'}"
     }
 
     stages {
@@ -101,13 +101,11 @@ pipeline {
         success {
             echo "=== POST: SUCCESS ==="
             script {
-                // Sirf master/main branch pe full notification
+                def nm = new NotificationManager(this)
                 if (env.BRANCH ==~ /master|main|staging/) {
-                    def nm = new NotificationManager(this)
                     nm.notifyAll('SUCCESS', buildDetails())
                 } else {
-                    echo "Feature branch — skipping full notification"
-                    def nm = new NotificationManager(this)
+                    echo "Feature branch — only email"
                     nm.sendEmail('SUCCESS', buildDetails())
                 }
             }
@@ -117,7 +115,6 @@ pipeline {
             echo "=== POST: FAILURE ==="
             script {
                 def nm = new NotificationManager(this)
-                // Failure pe sabko notify karo — har branch pe
                 nm.notifyAll('FAILURE', buildDetails())
             }
         }
@@ -132,9 +129,7 @@ pipeline {
     }
 }
 
-// ── Helper: Build Details Map ──────────────────────────────────
 def buildDetails() {
-    // Changes collect karo
     def changesList = []
     try {
         currentBuild.changeSets.each { changeSet ->
@@ -149,7 +144,7 @@ def buildDetails() {
     return [
         jobName    : env.JOB_NAME,
         buildNumber: env.BUILD_NUMBER,
-        branch     : env.BRANCH ?: env.GIT_BRANCH ?: 'master',
+        branch     : env.BRANCH ?: 'master',
         service    : SERVICE,
         version    : params.VERSION,
         environment: params.ENVIRONMENT,
