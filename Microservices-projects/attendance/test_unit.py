@@ -1,10 +1,8 @@
 import pytest
 import json
-import os
 from unittest.mock import patch, MagicMock
 
 # CONFIG_FILE env set karo import se pehle
-os.environ['CONFIG_FILE'] = os.path.join(
     os.path.dirname(__file__), 'config.yaml')
 
 from attendance_api import app
