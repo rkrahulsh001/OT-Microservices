@@ -163,15 +163,6 @@ pipeline {
                         """
                     }
                 }
-                cobertura(
-                    coberturaReportFile   : "${TEST_DIR}/coverage.xml",
-                    failNoReports         : false,
-                    failUnhealthy         : false,
-                    failUnstable          : false,
-                    lineCoverageTargets   : '50, 40, 30',
-                    methodCoverageTargets : '50, 40, 30',
-                    classCoverageTargets  : '50, 40, 30'
-                )
             }
         }
 
