@@ -17,7 +17,7 @@ class NotificationManager implements Serializable {
             String message = buildSlackMessage(status, emoji, details)
 
             script.slackSend(
-                channel    : '#jenkins-notifications',
+                channel    : '#jenkins-notifications-',
                 color      : color,
                 message    : message,
                 tokenCredentialId: 'slack-token'
@@ -26,7 +26,6 @@ class NotificationManager implements Serializable {
             script.echo "Slack notification sent: ${status}"
 
         } catch (Exception e) {
-            // graceful failure — notification fail hone se pipeline fail nahi hogi
             script.echo "WARNING: Slack notification failed: ${e.message}"
         }
     }
@@ -43,7 +42,7 @@ class NotificationManager implements Serializable {
                 body        : body,
                 mimeType    : 'text/html',
                 to          : details.recipients ?: 'YOUR_EMAIL@gmail.com',
-                attachLog   : status == 'FAILURE'   // failure pe log attach karo
+                attachLog   : status == 'FAILURE'
             )
 
             script.echo "Email notification sent: ${status}"
@@ -61,7 +60,6 @@ class NotificationManager implements Serializable {
             String emoji   = getEmoji(status)
             String message = buildTeamsMessage(status, emoji, details)
 
-            // Teams webhook call
             script.withCredentials([
                 script.string(
                     credentialsId: 'teams-webhook',
@@ -93,6 +91,20 @@ class NotificationManager implements Serializable {
     // ── PRIVATE — MESSAGE BUILDERS ────────────────────────────
 
     private String buildSlackMessage(String status, String emoji, Map d) {
+        String buildUrl   = d.buildUrl ?: ''
+        String quickLinks = ''
+
+        // Quick Links sirf SUCCESS/FAILURE/UNSTABLE pe dikhao, STARTED pe nahi
+        if (status != 'STARTED') {
+            quickLinks = """
+
+*Quick Links:*
+:link: <${buildUrl}|View Build Page>
+:bar_chart: <${buildUrl}testReport|Test Results>
+:chart_with_upwards_trend: <${buildUrl}Coverage_20Report|Coverage Report>
+:page_facing_up: <${buildUrl}artifact/Microservices-projects/attendance/test-report.pdf|Download PDF Report>"""
+        }
+
         return """
 ${emoji} *${status}: ${d.jobName} #${d.buildNumber}*
 > *Branch*    : ${d.branch}
@@ -101,7 +113,8 @@ ${emoji} *${status}: ${d.jobName} #${d.buildNumber}*
 > *Env*       : ${d.environment}
 > *Duration*  : ${d.duration}
 > *Changes*   : ${d.changes}
-> *Build URL* : ${d.buildUrl}
+> *Build URL* : ${buildUrl}
+> ${status == 'SUCCESS' ? 'SUCCESSFUL' : status}${quickLinks}
         """.trim()
     }
 
@@ -207,6 +220,10 @@ ${emoji} *${status}: ${d.jobName} #${d.buildNumber}*
         "@type": "OpenUri",
         "name": "View Build",
         "targets": [{"os": "default", "uri": "${d.buildUrl}"}]
+    },{
+        "@type": "OpenUri",
+        "name": "Download PDF Report",
+        "targets": [{"os": "default", "uri": "${d.buildUrl}artifact/Microservices-projects/attendance/test-report.pdf"}]
     }]
 }
         """.trim()
