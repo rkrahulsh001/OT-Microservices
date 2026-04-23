@@ -28,6 +28,7 @@ pipeline {
         BRANCH       = "${env.GIT_BRANCH?.replaceAll('origin/', '') ?: 'master'}"
         COVERAGE_MIN = '50'
         TEST_DIR     = 'Microservices-projects/attendance'
+        PATH         = "/var/lib/jenkins/.local/bin:${env.PATH}"
     }
 
     stages {
@@ -58,7 +59,7 @@ pipeline {
             steps {
                 dir("${TEST_DIR}") {
                     sh '''
-                        pip install -r requirements-test.txt \
+                        pip3 install -r requirements-test.txt \
                             --break-system-packages -q
                     '''
                 }
@@ -75,7 +76,7 @@ pipeline {
                             catchError(buildResult: 'UNSTABLE',
                                        stageResult: 'FAILURE') {
                                 sh """
-                                    python -m pytest test_unit.py \
+                                    python3 -m pytest test_unit.py \
                                         -v \
                                         --tb=short \
                                         --junitxml=unit-results.xml \
@@ -103,7 +104,7 @@ pipeline {
                             catchError(buildResult: 'UNSTABLE',
                                        stageResult: 'FAILURE') {
                                 sh '''
-                                    python -m pytest test_integration.py \
+                                    python3 -m pytest test_integration.py \
                                         -v \
                                         --tb=short \
                                         --junitxml=integration-results.xml \
@@ -156,7 +157,7 @@ pipeline {
                                stageResult: 'FAILURE') {
                         sh """
                             echo "=== Coverage Summary ==="
-                            python -m coverage report \
+                            python3 -m coverage report \
                                 --fail-under=${COVERAGE_MIN} || \
                             echo "WARNING: Coverage below ${COVERAGE_MIN}%"
                         """
@@ -182,7 +183,7 @@ pipeline {
                         export VERSION=${params.VERSION}
                         export ENVIRONMENT=${params.ENVIRONMENT}
                         export GIT_BRANCH=${env.BRANCH}
-                        python generate_report.py
+                        python3 generate_report.py
                         ls -la test-report.pdf
                     """
                 }
