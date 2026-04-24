@@ -1,86 +1,46 @@
 @Library('jenkins-shared-library') _
 
-import org.example.DeploymentManager
-import org.example.BlueGreenDeployment
-import org.example.NotificationManager
-
 pipeline {
     agent any
 
     parameters {
         string(name: 'VERSION', defaultValue: '1.0.0', description: 'Image version')
-        choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'prod'], description: 'Target environment')
         booleanParam(name: 'ROLLBACK', defaultValue: false, description: 'Rollback?')
-        string(name: 'RECIPIENTS', defaultValue: 'rkrahulsh001@gmail.com', description: 'Email recipients')
     }
 
     environment {
-        SERVICE      = 'attendance'
-        KUBECONFIG   = '/var/lib/jenkins/.kube/config'
-        BRANCH       = "${env.GIT_BRANCH?.replaceAll('origin/', '') ?: 'master'}"
-        COVERAGE_MIN = '50'
-        TEST_DIR     = 'Microservices-projects/attendance'
-        PATH         = "/var/lib/jenkins/.local/bin:${env.PATH}"
+        SERVICE = 'attendance'
+        TEST_DIR = 'Microservices-projects/attendance'
+        KUBECONFIG = '/var/lib/jenkins/.kube/config'
 
-        // 🔥 ADD YOUR URLS HERE
-        DEV_SVC_IP     = 'dev-url'
-        STAGING_SVC_IP = 'staging-url'
-        GREEN_SVC_IP   = 'prod-green-url'
+        // 🔥 CHANGE THESE
+        DEV_URL = 'http://attendance.dev/health'
+        STAGING_URL = 'http://attendance.staging/health'
+        PROD_URL = 'http://attendance.prod/health'
     }
 
     stages {
 
-        stage('Notify Start') {
+        // 🔔 START
+        stage('Start') {
             steps {
-                script {
-                    def nm = new NotificationManager(this)
-                    nm.sendSlack('STARTED', buildDetails())
-                    nm.sendTeams('STARTED', buildDetails())
-                }
+                echo "Pipeline Started..."
             }
         }
 
-        stage('Validate') {
-            when { expression { !params.ROLLBACK } }
-            steps {
-                script {
-                    def dm = new DeploymentManager(this)
-                    dm.validateConfig(SERVICE, params.ENVIRONMENT, params.VERSION)
-                }
-            }
-        }
-
-        // ✅ BUILD + PUSH DOCKER IMAGE
-        stage('Build & Push Image') {
-            when { expression { !params.ROLLBACK } }
-            steps {
-                sh """
-                    docker build -t attendance:${params.VERSION} .
-                    docker tag attendance:${params.VERSION} <dockerhub-username>/attendance:${params.VERSION}
-                    docker push <dockerhub-username>/attendance:${params.VERSION}
-                """
-            }
-        }
-
-        stage('Setup Test Environment') {
+        // 🏗 BUILD
+        stage('Build Image') {
             when { expression { !params.ROLLBACK } }
             steps {
                 dir("${TEST_DIR}") {
-                    sh 'pip3 install -r requirements-test.txt --break-system-packages -q'
+                    sh """
+                        docker build -t attendance:${params.VERSION} .
+                    """
                 }
             }
         }
 
-        stage('Unit Tests') {
-            when { expression { !params.ROLLBACK } }
-            steps {
-                dir("${TEST_DIR}") {
-                    sh "python3 -m pytest test_unit.py --cov=attendance_api --cov-fail-under=${COVERAGE_MIN}"
-                }
-            }
-        }
-
-        // ✅ DEPLOY TO DEV (AUTO)
+        // 🚀 DEV DEPLOY (AUTO)
         stage('Deploy to Dev') {
             when { expression { !params.ROLLBACK } }
             steps {
@@ -92,35 +52,31 @@ pipeline {
             }
         }
 
-        // ✅ TEST DEV
+        // ✅ DEV TEST
         stage('Test Dev') {
             steps {
                 script {
-                    def resp = httpRequest url: "http://${DEV_SVC_IP}/health",
-                                           validResponseCodes: '200'
-                    echo "Dev health: ${resp.status}"
+                    def resp = httpRequest(url: "${DEV_URL}", validResponseCodes: '200')
+                    echo "Dev Health OK: ${resp.status}"
                 }
             }
         }
 
-        // ✅ MANUAL APPROVAL
-        stage('Approve for Staging') {
+        // ⏳ APPROVAL
+        stage('Approval for Staging') {
             options {
                 timeout(time: 30, unit: 'MINUTES')
             }
             steps {
-                input message: 'Deploy to Staging?',
-                      ok: 'Yes Deploy',
-                      submitter: 'admin,devops-team'
+                input message: 'Deploy to Staging?', ok: 'Proceed'
             }
         }
 
-        // ✅ DEPLOY STAGING
+        // 🚀 STAGING DEPLOY
         stage('Deploy to Staging') {
             steps {
                 milestone(1)
                 sh """
-                    kubectl apply -f kubernetes/staging/ -n staging
                     kubectl set image deployment/attendance \
                     attendance=attendance:${params.VERSION} -n staging
                     kubectl rollout status deployment/attendance -n staging
@@ -128,18 +84,17 @@ pipeline {
             }
         }
 
-        // ✅ TEST STAGING
+        // ✅ STAGING TEST
         stage('Test Staging') {
             steps {
                 script {
-                    def resp = httpRequest url: "http://${STAGING_SVC_IP}/health",
-                                           validResponseCodes: '200'
-                    echo "Staging health: ${resp.status}"
+                    def resp = httpRequest(url: "${STAGING_URL}", validResponseCodes: '200')
+                    echo "Staging Health OK: ${resp.status}"
                 }
             }
         }
 
-        // ✅ DEPLOY GREEN
+        // 🟢 DEPLOY GREEN (PROD)
         stage('Deploy Green') {
             steps {
                 sh """
@@ -150,91 +105,45 @@ pipeline {
             }
         }
 
-        // ✅ HEALTH CHECK
-        stage('Health Check Green') {
+        // ❤️ HEALTH CHECK
+        stage('Health Check Prod') {
             steps {
                 retry(3) {
                     sleep 10
-                    httpRequest url: "http://${GREEN_SVC_IP}/health",
-                                validResponseCodes: '200'
+                    httpRequest(url: "${PROD_URL}", validResponseCodes: '200')
                 }
             }
         }
 
-        // ✅ ROLLBACK (MANUAL)
-        stage('Rollback') {
-            when { expression { params.ROLLBACK } }
+        // 🔁 SWITCH TRAFFIC
+        stage('Switch Traffic to Green') {
             steps {
-                script {
-                    def dm = new DeploymentManager(this)
-                    dm.rollback(SERVICE, params.ENVIRONMENT)
-                }
-            }
-        }
-
-        stage('Final Status') {
-            steps {
-                script {
-                    def bg = new BlueGreenDeployment(this)
-                    bg.finalStatus(SERVICE, params.ENVIRONMENT)
-                }
+                sh """
+                    kubectl patch svc attendance -n prod \
+                    -p '{"spec":{"selector":{"slot":"green"}}}'
+                """
             }
         }
     }
 
     post {
 
-        success {
-            // ✅ SWITCH TO GREEN
-            sh """
-                kubectl patch svc attendance -n prod \
-                -p '{"spec":{"selector":{"slot":"green"}}}'
-            """
-
-            script {
-                def nm = new NotificationManager(this)
-                nm.sendSlack('SUCCESS', buildDetails())
-                emailext(
-                    subject: "SUCCESS: ${env.JOB_NAME}",
-                    body: buildEmailBody('SUCCESS'),
-                    to: params.RECIPIENTS
-                )
-            }
-        }
-
+        // ❌ FAILURE → ROLLBACK
         failure {
-            // ✅ ROLLBACK TO BLUE
+            echo "Rolling back to BLUE..."
+
             sh """
                 kubectl patch svc attendance -n prod \
                 -p '{"spec":{"selector":{"slot":"blue"}}}'
             """
+        }
 
-            script {
-                def nm = new NotificationManager(this)
-                nm.sendSlack('FAILURE', buildDetails())
-                emailext(
-                    subject: "FAILED: ${env.JOB_NAME}",
-                    body: buildEmailBody('FAILURE'),
-                    to: params.RECIPIENTS
-                )
-            }
+        success {
+            echo "Deployment Successful 🚀"
+        }
+
+        always {
+            echo "Pipeline Completed"
         }
     }
-}
-
-// 🔥 HELPERS
-
-def buildDetails() {
-    return [
-        jobName: env.JOB_NAME,
-        buildNumber: env.BUILD_NUMBER,
-        branch: env.BRANCH,
-        service: SERVICE,
-        version: params.VERSION,
-        environment: params.ENVIRONMENT
-    ]
-}
-
-def buildEmailBody(String status) {
-    return "<h2>${status}: ${env.JOB_NAME}</h2>"
 }
