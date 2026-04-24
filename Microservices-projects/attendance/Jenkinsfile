@@ -379,11 +379,11 @@ pipeline {
                 script {
                     def dm = new DeploymentManager(this)
                     dm.rollback(SERVICE, params.ENVIRONMENT)
-                }
-                // If prod rollback, ensure traffic goes back to blue
-                if (params.ENVIRONMENT == 'prod') {
-                    sh "kubectl patch svc attendance -n prod -p '{\"spec\":{\"selector\":{\"slot\":\"blue\"}}}'"
-                    echo "✅ Rollback complete - traffic switched to blue"
+                    // If prod rollback, ensure traffic goes back to blue
+                    if (params.ENVIRONMENT == 'prod') {
+                        sh "kubectl patch svc attendance -n prod -p '{\"spec\":{\"selector\":{\"slot\":\"blue\"}}}'"
+                        echo "✅ Rollback complete - traffic switched to blue"
+                    }
                 }
             }
         }
