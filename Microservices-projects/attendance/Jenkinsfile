@@ -29,9 +29,6 @@ pipeline {
         COVERAGE_MIN = '50'
         TEST_DIR     = 'Microservices-projects/attendance'
         PATH         = "/var/lib/jenkins/.local/bin:${env.PATH}"
-        DEV_NAMESPACE = 'dev'
-        STAGING_NAMESPACE = 'staging'
-        PROD_NAMESPACE = 'prod'
     }
 
     stages {
@@ -206,8 +203,7 @@ pipeline {
             }
         }
 
-        // ============ ENVIRONMENT DEPLOYMENT STAGES ============
-        
+        // ============ DEV ENVIRONMENT ============
         stage('Deploy to Dev') {
             when {
                 allOf {
@@ -217,10 +213,17 @@ pipeline {
             }
             steps {
                 script {
-                    def dm = new DeploymentManager(this)
-                    dm.deploy(SERVICE, 'dev', params.VERSION)
+                    // For dev, deploy to both blue and green with same version
+                    sh """
+                        kubectl set image deployment/attendance-blue \
+                              attendance=attendance:${params.VERSION} -n dev
+                        kubectl set image deployment/attendance-green \
+                              attendance=attendance:${params.VERSION} -n dev
+                        kubectl rollout status deployment/attendance-blue -n dev --timeout=120s
+                        kubectl rollout status deployment/attendance-green -n dev --timeout=120s
+                    """
+                    echo "✅ Dev deployment complete"
                 }
-                sh "kubectl rollout status deployment/attendance -n dev --timeout=120s || true"
             }
         }
 
@@ -234,11 +237,13 @@ pipeline {
             steps {
                 script {
                     try {
-                        def svc_ip = sh(script: "kubectl get svc attendance -n dev -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
-                        retry(3) {
+                        sh """
+                            kubectl port-forward service/attendance -n dev 8080:80 &
+                            PF_PID=\$!
                             sleep 5
-                            sh "curl -f http://${svc_ip}/health || exit 1"
-                        }
+                            curl -f http://localhost:8080/health || exit 1
+                            kill \$PF_PID
+                        """
                         echo "✅ Dev health check passed"
                     } catch (e) {
                         error "❌ Dev health check failed: ${e.message}"
@@ -247,6 +252,7 @@ pipeline {
             }
         }
 
+        // ============ STAGING ENVIRONMENT ============
         stage('Manual Approval for Staging') {
             when {
                 allOf {
@@ -260,12 +266,7 @@ pipeline {
             steps {
                 input message: '🚀 Deploy to Staging?',
                       ok: 'Yes, deploy to Staging',
-                      submitter: 'admin,devops-team',
-                      parameters: [
-                          string(defaultValue: params.VERSION,
-                                 description: 'Version to deploy',
-                                 name: 'STAGING_VERSION')
-                      ]
+                      submitter: 'admin,devops-team'
             }
         }
 
@@ -279,10 +280,16 @@ pipeline {
             steps {
                 milestone(1)
                 script {
-                    def dm = new DeploymentManager(this)
-                    dm.deploy(SERVICE, 'staging', params.VERSION)
+                    sh """
+                        kubectl set image deployment/attendance-blue \
+                              attendance=attendance:${params.VERSION} -n staging
+                        kubectl set image deployment/attendance-green \
+                              attendance=attendance:${params.VERSION} -n staging
+                        kubectl rollout status deployment/attendance-blue -n staging --timeout=120s
+                        kubectl rollout status deployment/attendance-green -n staging --timeout=120s
+                    """
+                    echo "✅ Staging deployment complete"
                 }
-                sh "kubectl rollout status deployment/attendance -n staging --timeout=120s"
             }
         }
 
@@ -296,19 +303,22 @@ pipeline {
             steps {
                 script {
                     try {
-                        def svc_ip = sh(script: "kubectl get svc attendance -n staging -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
-                        retry(3) {
+                        sh """
+                            kubectl port-forward service/attendance -n staging 8081:80 &
+                            PF_PID=\$!
                             sleep 5
-                            sh "curl -f http://${svc_ip}/health || exit 1"
-                        }
+                            curl -f http://localhost:8081/health || exit 1
+                            kill \$PF_PID
+                        """
                         echo "✅ Staging health check passed"
                     } catch (e) {
-                        error "❌ Staging health check failed - rolling back"
+                        error "❌ Staging health check failed"
                     }
                 }
             }
         }
 
+        // ============ PRODUCTION ENVIRONMENT (Blue-Green) ============
         stage('Manual Approval for Production') {
             when {
                 allOf {
@@ -326,7 +336,7 @@ pipeline {
             }
         }
 
-        stage('Deploy to Green (Prod Blue-Green)') {
+        stage('Deploy to Green (Prod)') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
@@ -335,14 +345,14 @@ pipeline {
             }
             steps {
                 script {
-                    def dm = new DeploymentManager(this)
-                    dm.deploy(SERVICE, 'prod', params.VERSION)
+                    // Deploy only to green first
+                    sh """
+                        kubectl set image deployment/attendance-green \
+                              attendance=attendance:${params.VERSION} -n prod
+                        kubectl rollout status deployment/attendance-green -n prod --timeout=180s
+                    """
+                    echo "✅ Green deployment updated"
                 }
-                sh """
-                    kubectl set image deployment/attendance-green \
-                          attendance=attendance:${params.VERSION} -n prod
-                    kubectl rollout status deployment/attendance-green -n prod --timeout=180s
-                """
             }
         }
 
@@ -356,16 +366,17 @@ pipeline {
             steps {
                 script {
                     try {
-                        def green_svc_ip = sh(script: "kubectl get svc attendance-green -n prod -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
                         retry(3) {
                             sleep 10
-                            sh "curl -f http://${green_svc_ip}/health || exit 1"
+                            sh """
+                                kubectl port-forward service/attendance-green -n prod 8082:80 &
+                                PF_PID=\$!
+                                sleep 5
+                                curl -f http://localhost:8082/health || exit 1
+                                kill \$PF_PID
+                            """
                         }
                         echo "✅ Green deployment health check passed"
-                        
-                        // Switch traffic to green
-                        sh "kubectl patch svc attendance -n prod -p '{\"spec\":{\"selector\":{\"slot\":\"green\"}}}'"
-                        echo "✅ Traffic switched to green deployment"
                     } catch (e) {
                         error "❌ Green health check failed - keeping blue active"
                     }
@@ -373,16 +384,60 @@ pipeline {
             }
         }
 
+        stage('Switch Traffic to Green') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'prod' }
+                }
+            }
+            steps {
+                script {
+                    sh """
+                        kubectl patch svc attendance -n prod -p '{"spec":{"selector":{"slot":"green"}}}'
+                        echo "✅ Traffic switched to green deployment"
+                    """
+                }
+            }
+        }
+
+        stage('Verify Production') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'prod' }
+                }
+            }
+            steps {
+                script {
+                    sh """
+                        kubectl port-forward service/attendance -n prod 8083:80 &
+                        PF_PID=\$!
+                        sleep 5
+                        curl -f http://localhost:8083/health || exit 1
+                        kill \$PF_PID
+                    """
+                    echo "✅ Production verified - green is live"
+                }
+            }
+        }
+
+        // ============ ROLLBACK STAGE ============
         stage('Rollback') {
             when { expression { params.ROLLBACK } }
             steps {
                 script {
-                    def dm = new DeploymentManager(this)
-                    dm.rollback(SERVICE, params.ENVIRONMENT)
-                    // If prod rollback, ensure traffic goes back to blue
                     if (params.ENVIRONMENT == 'prod') {
-                        sh "kubectl patch svc attendance -n prod -p '{\"spec\":{\"selector\":{\"slot\":\"blue\"}}}'"
-                        echo "✅ Rollback complete - traffic switched to blue"
+                        sh """
+                            kubectl patch svc attendance -n prod -p '{"spec":{"selector":{"slot":"blue"}}}'
+                            echo "✅ Rollback complete - traffic switched to blue"
+                        """
+                    } else {
+                        sh """
+                            kubectl rollout undo deployment/attendance-blue -n ${params.ENVIRONMENT}
+                            kubectl rollout undo deployment/attendance-green -n ${params.ENVIRONMENT}
+                            echo "✅ Rollback complete for ${params.ENVIRONMENT}"
+                        """
                     }
                 }
             }
@@ -391,8 +446,13 @@ pipeline {
         stage('Final Status') {
             steps {
                 script {
-                    def bg = new BlueGreenDeployment(this)
-                    bg.finalStatus(SERVICE, params.ENVIRONMENT)
+                    echo "=== FINAL STATUS ==="
+                    sh "kubectl get all -n ${params.ENVIRONMENT}"
+                    
+                    if (params.ENVIRONMENT == 'prod') {
+                        def activeSlot = sh(script: "kubectl get svc attendance -n prod -o jsonpath='{.spec.selector.slot}'", returnStdout: true).trim()
+                        echo "Active slot in production: ${activeSlot}"
+                    }
                 }
             }
         }
