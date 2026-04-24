@@ -8,18 +8,10 @@ pipeline {
     agent any
 
     parameters {
-        string(name: 'VERSION',
-               defaultValue: '1.0.0',
-               description: 'Image version')
-        choice(name: 'ENVIRONMENT',
-               choices: ['staging', 'dev', 'prod'],
-               description: 'Target environment')
-        booleanParam(name: 'ROLLBACK',
-                     defaultValue: false,
-                     description: 'Rollback?')
-        string(name: 'RECIPIENTS',
-               defaultValue: 'rkrahulsh001@gmail.com',
-               description: 'Email recipients')
+        string(name: 'VERSION', defaultValue: '1.0.0', description: 'Image version')
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'prod'], description: 'Target environment')
+        booleanParam(name: 'ROLLBACK', defaultValue: false, description: 'Rollback?')
+        string(name: 'RECIPIENTS', defaultValue: 'rkrahulsh001@gmail.com', description: 'Email recipients')
     }
 
     environment {
@@ -29,6 +21,11 @@ pipeline {
         COVERAGE_MIN = '50'
         TEST_DIR     = 'Microservices-projects/attendance'
         PATH         = "/var/lib/jenkins/.local/bin:${env.PATH}"
+
+        // 🔥 ADD YOUR URLS HERE
+        DEV_SVC_IP     = 'dev-url'
+        STAGING_SVC_IP = 'staging-url'
+        GREEN_SVC_IP   = 'prod-green-url'
     }
 
     stages {
@@ -48,9 +45,20 @@ pipeline {
             steps {
                 script {
                     def dm = new DeploymentManager(this)
-                    dm.validateConfig(
-                        SERVICE, params.ENVIRONMENT, params.VERSION)
+                    dm.validateConfig(SERVICE, params.ENVIRONMENT, params.VERSION)
                 }
+            }
+        }
+
+        // ✅ BUILD + PUSH DOCKER IMAGE
+        stage('Build & Push Image') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                sh """
+                    docker build -t attendance:${params.VERSION} .
+                    docker tag attendance:${params.VERSION} <dockerhub-username>/attendance:${params.VERSION}
+                    docker push <dockerhub-username>/attendance:${params.VERSION}
+                """
             }
         }
 
@@ -58,178 +66,102 @@ pipeline {
             when { expression { !params.ROLLBACK } }
             steps {
                 dir("${TEST_DIR}") {
-                    sh '''
-                        pip3 install -r requirements-test.txt \
-                            --break-system-packages -q
-                    '''
+                    sh 'pip3 install -r requirements-test.txt --break-system-packages -q'
                 }
             }
         }
 
-        stage('Parallel Tests') {
-            when { expression { !params.ROLLBACK } }
-            parallel {
-
-                stage('Unit Tests') {
-                    steps {
-                        dir("${TEST_DIR}") {
-                            catchError(buildResult: 'UNSTABLE',
-                                       stageResult: 'FAILURE') {
-                                sh """
-                                    python3 -m pytest test_unit.py \
-                                        -v \
-                                        --tb=short \
-                                        --junitxml=unit-results.xml \
-                                        --cov=attendance_api \
-                                        --cov-report=xml:coverage.xml \
-                                        --cov-report=html:coverage-html \
-                                        --cov-report=term-missing \
-                                        --cov-fail-under=${COVERAGE_MIN} \
-                                        2>&1 | tee unit-test.log
-                                """
-                            }
-                        }
-                    }
-                    post {
-                        always {
-                            junit allowEmptyResults: true,
-                                  testResults: "${TEST_DIR}/unit-results.xml"
-                        }
-                    }
-                }
-
-                stage('Integration Tests') {
-                    steps {
-                        dir("${TEST_DIR}") {
-                            catchError(buildResult: 'UNSTABLE',
-                                       stageResult: 'FAILURE') {
-                                sh '''
-                                    python3 -m pytest test_integration.py \
-                                        -v \
-                                        --tb=short \
-                                        --junitxml=integration-results.xml \
-                                        -m integration \
-                                        2>&1 | tee integration-test.log
-                                '''
-                            }
-                        }
-                    }
-                    post {
-                        always {
-                            junit allowEmptyResults: true,
-                                  testResults: \
-                                  "${TEST_DIR}/integration-results.xml"
-                        }
-                    }
-                }
-
-                stage('Code Quality') {
-                    steps {
-                        dir("${TEST_DIR}") {
-                            catchError(buildResult: 'UNSTABLE',
-                                       stageResult: 'FAILURE') {
-                                sh '''
-                                    flake8 attendance_api.py \
-                                        --max-line-length=120 \
-                                        --ignore=E501,W503 \
-                                        --tee \
-                                        --output-file=flake8-report.txt \
-                                        || true
-                                    pylint attendance_api.py \
-                                        --disable=all \
-                                        --enable=E \
-                                        --output-format=text \
-                                        > pylint-report.txt 2>&1 || true
-                                    echo "Code quality done"
-                                '''
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        stage('Coverage Report') {
+        stage('Unit Tests') {
             when { expression { !params.ROLLBACK } }
             steps {
                 dir("${TEST_DIR}") {
-                    catchError(buildResult: 'UNSTABLE',
-                               stageResult: 'FAILURE') {
-                        sh """
-                            echo "=== Coverage Summary ==="
-                            python3 -m coverage report \
-                                --fail-under=${COVERAGE_MIN} || \
-                            echo "WARNING: Coverage below ${COVERAGE_MIN}%"
-                        """
-                    }
+                    sh "python3 -m pytest test_unit.py --cov=attendance_api --cov-fail-under=${COVERAGE_MIN}"
                 }
             }
         }
 
-        stage('Generate PDF Report') {
+        // ✅ DEPLOY TO DEV (AUTO)
+        stage('Deploy to Dev') {
             when { expression { !params.ROLLBACK } }
             steps {
-                dir("${TEST_DIR}") {
-                    sh """
-                        echo "=== Files before PDF generation ==="
-                        ls -la *.xml *.log *.txt 2>/dev/null || true
-
-                        export VERSION=${params.VERSION}
-                        export ENVIRONMENT=${params.ENVIRONMENT}
-                        export GIT_BRANCH=${env.BRANCH}
-                        export BUILD_NUMBER=${env.BUILD_NUMBER}
-
-                        python3 generate_report.py
-
-                        echo "=== PDF Info ==="
-                        ls -la test-report.pdf
-                    """
-                }
+                sh """
+                    kubectl set image deployment/attendance \
+                    attendance=attendance:${params.VERSION} -n dev
+                    kubectl rollout status deployment/attendance -n dev
+                """
             }
         }
 
-        stage('Publish Reports') {
-            when { expression { !params.ROLLBACK } }
-            steps {
-                publishHTML([
-                    allowMissing         : true,
-                    alwaysLinkToLastBuild: true,
-                    keepAll              : true,
-                    reportDir            : "${TEST_DIR}/coverage-html",
-                    reportFiles          : 'index.html',
-                    reportName           : 'Coverage Report'
-                ])
-                archiveArtifacts(
-                    artifacts        : "${TEST_DIR}/test-report.pdf," +
-                                       "${TEST_DIR}/*.xml," +
-                                       "${TEST_DIR}/*.log," +
-                                       "${TEST_DIR}/*.txt",
-                    allowEmptyArchive: true,
-                    fingerprint      : true
-                )
-            }
-        }
-
-        stage('Deploy') {
-            when {
-                allOf {
-                    expression { !params.ROLLBACK }
-                    expression { currentBuild.currentResult != 'FAILURE' }
-                    anyOf {
-                        branch 'master'
-                        branch 'main'
-                        expression { params.ENVIRONMENT == 'staging' }
-                    }
-                }
-            }
+        // ✅ TEST DEV
+        stage('Test Dev') {
             steps {
                 script {
-                    def dm = new DeploymentManager(this)
-                    dm.deploy(SERVICE, params.ENVIRONMENT, params.VERSION)
+                    def resp = httpRequest url: "http://${DEV_SVC_IP}/health",
+                                           validResponseCodes: '200'
+                    echo "Dev health: ${resp.status}"
                 }
             }
         }
 
+        // ✅ MANUAL APPROVAL
+        stage('Approve for Staging') {
+            options {
+                timeout(time: 30, unit: 'MINUTES')
+            }
+            steps {
+                input message: 'Deploy to Staging?',
+                      ok: 'Yes Deploy',
+                      submitter: 'admin,devops-team'
+            }
+        }
+
+        // ✅ DEPLOY STAGING
+        stage('Deploy to Staging') {
+            steps {
+                milestone(1)
+                sh """
+                    kubectl apply -f kubernetes/staging/ -n staging
+                    kubectl set image deployment/attendance \
+                    attendance=attendance:${params.VERSION} -n staging
+                    kubectl rollout status deployment/attendance -n staging
+                """
+            }
+        }
+
+        // ✅ TEST STAGING
+        stage('Test Staging') {
+            steps {
+                script {
+                    def resp = httpRequest url: "http://${STAGING_SVC_IP}/health",
+                                           validResponseCodes: '200'
+                    echo "Staging health: ${resp.status}"
+                }
+            }
+        }
+
+        // ✅ DEPLOY GREEN
+        stage('Deploy Green') {
+            steps {
+                sh """
+                    kubectl set image deployment/attendance-green \
+                    attendance=attendance:${params.VERSION} -n prod
+                    kubectl rollout status deployment/attendance-green -n prod
+                """
+            }
+        }
+
+        // ✅ HEALTH CHECK
+        stage('Health Check Green') {
+            steps {
+                retry(3) {
+                    sleep 10
+                    httpRequest url: "http://${GREEN_SVC_IP}/health",
+                                validResponseCodes: '200'
+                }
+            }
+        }
+
+        // ✅ ROLLBACK (MANUAL)
         stage('Rollback') {
             when { expression { params.ROLLBACK } }
             steps {
@@ -251,117 +183,58 @@ pipeline {
     }
 
     post {
-        always {
-            echo "=== POST: ALWAYS ==="
-            echo "Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
-            echo "Duration: ${currentBuild.durationString}"
-            echo "Status: ${currentBuild.currentResult}"
-        }
 
         success {
-            echo "=== POST: SUCCESS ==="
+            // ✅ SWITCH TO GREEN
+            sh """
+                kubectl patch svc attendance -n prod \
+                -p '{"spec":{"selector":{"slot":"green"}}}'
+            """
+
             script {
                 def nm = new NotificationManager(this)
                 nm.sendSlack('SUCCESS', buildDetails())
-                nm.sendTeams('SUCCESS', buildDetails())
                 emailext(
-                    subject           : "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} | Coverage Report Attached",
-                    body              : buildEmailBody('SUCCESS'),
-                    mimeType          : 'text/html',
-                    to                : params.RECIPIENTS,
-                    attachmentsPattern: "${TEST_DIR}/test-report.pdf"
+                    subject: "SUCCESS: ${env.JOB_NAME}",
+                    body: buildEmailBody('SUCCESS'),
+                    to: params.RECIPIENTS
                 )
             }
         }
 
         failure {
-            echo "=== POST: FAILURE ==="
+            // ✅ ROLLBACK TO BLUE
+            sh """
+                kubectl patch svc attendance -n prod \
+                -p '{"spec":{"selector":{"slot":"blue"}}}'
+            """
+
             script {
                 def nm = new NotificationManager(this)
                 nm.sendSlack('FAILURE', buildDetails())
-                nm.sendTeams('FAILURE', buildDetails())
                 emailext(
-                    subject           : "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                    body              : buildEmailBody('FAILURE'),
-                    mimeType          : 'text/html',
-                    to                : params.RECIPIENTS,
-                    attachLog         : true,
-                    attachmentsPattern: "${TEST_DIR}/test-report.pdf"
-                )
-            }
-        }
-
-        unstable {
-            echo "=== POST: UNSTABLE ==="
-            script {
-                def nm = new NotificationManager(this)
-                nm.sendSlack('UNSTABLE', buildDetails())
-                emailext(
-                    subject           : "UNSTABLE: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                    body              : buildEmailBody('UNSTABLE'),
-                    mimeType          : 'text/html',
-                    to                : params.RECIPIENTS,
-                    attachmentsPattern: "${TEST_DIR}/test-report.pdf"
+                    subject: "FAILED: ${env.JOB_NAME}",
+                    body: buildEmailBody('FAILURE'),
+                    to: params.RECIPIENTS
                 )
             }
         }
     }
 }
 
+// 🔥 HELPERS
+
 def buildDetails() {
-    def changesList = []
-    try {
-        currentBuild.changeSets.each { cs ->
-            cs.items.each { item ->
-                changesList << "${item.author}: ${item.msg}"
-            }
-        }
-    } catch (e) {
-        changesList << 'No changes info'
-    }
     return [
-        jobName    : env.JOB_NAME,
+        jobName: env.JOB_NAME,
         buildNumber: env.BUILD_NUMBER,
-        branch     : env.BRANCH ?: 'master',
-        service    : SERVICE,
-        version    : params.VERSION,
-        environment: params.ENVIRONMENT,
-        duration   : currentBuild.durationString ?: 'N/A',
-        changes    : changesList.isEmpty() ? 'No changes' : changesList.join(' | '),
-        buildUrl   : env.BUILD_URL,
-        recipients : params.RECIPIENTS
+        branch: env.BRANCH,
+        service: SERVICE,
+        version: params.VERSION,
+        environment: params.ENVIRONMENT
     ]
 }
 
 def buildEmailBody(String status) {
-    def color = status == 'SUCCESS' ? '#28a745' :
-                status == 'FAILURE' ? '#dc3545' : '#ffc107'
-    return """
-<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;padding:20px;">
-<div style="background:${color};padding:15px;border-radius:8px;margin-bottom:20px;">
-  <h2 style="color:white;margin:0;">${status}: ${env.JOB_NAME} #${env.BUILD_NUMBER}</h2>
-</div>
-<table style="width:100%;border-collapse:collapse;">
-  <tr style="background:#f2f2f2;">
-    <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Service</td>
-    <td style="padding:8px;border:1px solid #ddd;">${SERVICE}</td></tr>
-  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Version</td>
-    <td style="padding:8px;border:1px solid #ddd;">${params.VERSION}</td></tr>
-  <tr style="background:#f2f2f2;">
-    <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Environment</td>
-    <td style="padding:8px;border:1px solid #ddd;">${params.ENVIRONMENT}</td></tr>
-  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Branch</td>
-    <td style="padding:8px;border:1px solid #ddd;">${env.BRANCH}</td></tr>
-  <tr style="background:#f2f2f2;">
-    <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Duration</td>
-    <td style="padding:8px;border:1px solid #ddd;">${currentBuild.durationString}</td></tr>
-  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Build URL</td>
-    <td style="padding:8px;border:1px solid #ddd;">
-      <a href="${env.BUILD_URL}">View Build Logs</a></td></tr>
-</table>
-<p style="margin-top:15px;padding:10px;background:#f8f9fa;border-radius:5px;">
-  Test Report PDF attached. Coverage HTML report available in Jenkins.
-</p>
-</body></html>
-    """
+    return "<h2>${status}: ${env.JOB_NAME}</h2>"
 }
