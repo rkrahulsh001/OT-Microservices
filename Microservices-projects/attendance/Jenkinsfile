@@ -12,7 +12,7 @@ pipeline {
                defaultValue: '1.0.0',
                description: 'Image version')
         choice(name: 'ENVIRONMENT',
-               choices: ['staging', 'dev', 'prod'],
+               choices: ['dev', 'staging', 'prod'],
                description: 'Target environment')
         booleanParam(name: 'ROLLBACK',
                      defaultValue: false,
@@ -29,6 +29,9 @@ pipeline {
         COVERAGE_MIN = '50'
         TEST_DIR     = 'Microservices-projects/attendance'
         PATH         = "/var/lib/jenkins/.local/bin:${env.PATH}"
+        DEV_NAMESPACE = 'dev'
+        STAGING_NAMESPACE = 'staging'
+        PROD_NAMESPACE = 'prod'
     }
 
     stages {
@@ -171,18 +174,11 @@ pipeline {
             steps {
                 dir("${TEST_DIR}") {
                     sh """
-                        echo "=== Files before PDF generation ==="
-                        ls -la *.xml *.log *.txt 2>/dev/null || true
-
                         export VERSION=${params.VERSION}
                         export ENVIRONMENT=${params.ENVIRONMENT}
                         export GIT_BRANCH=${env.BRANCH}
                         export BUILD_NUMBER=${env.BUILD_NUMBER}
-
                         python3 generate_report.py
-
-                        echo "=== PDF Info ==="
-                        ls -la test-report.pdf
                     """
                 }
             }
@@ -210,22 +206,169 @@ pipeline {
             }
         }
 
-        stage('Deploy') {
+        // ============ ENVIRONMENT DEPLOYMENT STAGES ============
+        
+        stage('Deploy to Dev') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
-                    expression { currentBuild.currentResult != 'FAILURE' }
-                    anyOf {
-                        branch 'master'
-                        branch 'main'
-                        expression { params.ENVIRONMENT == 'staging' }
-                    }
+                    expression { params.ENVIRONMENT == 'dev' }
                 }
             }
             steps {
                 script {
                     def dm = new DeploymentManager(this)
-                    dm.deploy(SERVICE, params.ENVIRONMENT, params.VERSION)
+                    dm.deploy(SERVICE, 'dev', params.VERSION)
+                }
+                sh "kubectl rollout status deployment/attendance -n dev --timeout=120s || true"
+            }
+        }
+
+        stage('Health Check - Dev') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'dev' }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        def svc_ip = sh(script: "kubectl get svc attendance -n dev -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
+                        retry(3) {
+                            sleep 5
+                            sh "curl -f http://${svc_ip}/health || exit 1"
+                        }
+                        echo "✅ Dev health check passed"
+                    } catch (e) {
+                        error "❌ Dev health check failed: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Manual Approval for Staging') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'staging' }
+                }
+            }
+            options {
+                timeout(time: 30, unit: 'MINUTES')
+            }
+            steps {
+                input message: '🚀 Deploy to Staging?',
+                      ok: 'Yes, deploy to Staging',
+                      submitter: 'admin,devops-team',
+                      parameters: [
+                          string(defaultValue: params.VERSION,
+                                 description: 'Version to deploy',
+                                 name: 'STAGING_VERSION')
+                      ]
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'staging' }
+                }
+            }
+            steps {
+                milestone(1)
+                script {
+                    def dm = new DeploymentManager(this)
+                    dm.deploy(SERVICE, 'staging', params.VERSION)
+                }
+                sh "kubectl rollout status deployment/attendance -n staging --timeout=120s"
+            }
+        }
+
+        stage('Health Check - Staging') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'staging' }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        def svc_ip = sh(script: "kubectl get svc attendance -n staging -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
+                        retry(3) {
+                            sleep 5
+                            sh "curl -f http://${svc_ip}/health || exit 1"
+                        }
+                        echo "✅ Staging health check passed"
+                    } catch (e) {
+                        error "❌ Staging health check failed - rolling back"
+                    }
+                }
+            }
+        }
+
+        stage('Manual Approval for Production') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'prod' }
+                }
+            }
+            options {
+                timeout(time: 30, unit: 'MINUTES')
+            }
+            steps {
+                input message: '🔴 Deploy to PRODUCTION?',
+                      ok: 'Yes, deploy to Production',
+                      submitter: 'admin,devops-team'
+            }
+        }
+
+        stage('Deploy to Green (Prod Blue-Green)') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'prod' }
+                }
+            }
+            steps {
+                script {
+                    def dm = new DeploymentManager(this)
+                    dm.deploy(SERVICE, 'prod', params.VERSION)
+                }
+                sh """
+                    kubectl set image deployment/attendance-green \
+                          attendance=attendance:${params.VERSION} -n prod
+                    kubectl rollout status deployment/attendance-green -n prod --timeout=180s
+                """
+            }
+        }
+
+        stage('Health Check - Green') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { params.ENVIRONMENT == 'prod' }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        def green_svc_ip = sh(script: "kubectl get svc attendance-green -n prod -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
+                        retry(3) {
+                            sleep 10
+                            sh "curl -f http://${green_svc_ip}/health || exit 1"
+                        }
+                        echo "✅ Green deployment health check passed"
+                        
+                        // Switch traffic to green
+                        sh "kubectl patch svc attendance -n prod -p '{\"spec\":{\"selector\":{\"slot\":\"green\"}}}'"
+                        echo "✅ Traffic switched to green deployment"
+                    } catch (e) {
+                        error "❌ Green health check failed - keeping blue active"
+                    }
                 }
             }
         }
@@ -236,6 +379,11 @@ pipeline {
                 script {
                     def dm = new DeploymentManager(this)
                     dm.rollback(SERVICE, params.ENVIRONMENT)
+                }
+                // If prod rollback, ensure traffic goes back to blue
+                if (params.ENVIRONMENT == 'prod') {
+                    sh "kubectl patch svc attendance -n prod -p '{\"spec\":{\"selector\":{\"slot\":\"blue\"}}}'"
+                    echo "✅ Rollback complete - traffic switched to blue"
                 }
             }
         }
@@ -265,7 +413,7 @@ pipeline {
                 nm.sendSlack('SUCCESS', buildDetails())
                 nm.sendTeams('SUCCESS', buildDetails())
                 emailext(
-                    subject           : "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} | Coverage Report Attached",
+                    subject           : "✅ SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body              : buildEmailBody('SUCCESS'),
                     mimeType          : 'text/html',
                     to                : params.RECIPIENTS,
@@ -277,11 +425,17 @@ pipeline {
         failure {
             echo "=== POST: FAILURE ==="
             script {
+                // Auto-rollback for prod failures
+                if (params.ENVIRONMENT == 'prod' && !params.ROLLBACK) {
+                    sh "kubectl patch svc attendance -n prod -p '{\"spec\":{\"selector\":{\"slot\":\"blue\"}}}'"
+                    echo "🔄 Auto-rollback: Traffic switched to blue due to failure"
+                }
+                
                 def nm = new NotificationManager(this)
                 nm.sendSlack('FAILURE', buildDetails())
                 nm.sendTeams('FAILURE', buildDetails())
                 emailext(
-                    subject           : "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    subject           : "❌ FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body              : buildEmailBody('FAILURE'),
                     mimeType          : 'text/html',
                     to                : params.RECIPIENTS,
@@ -297,7 +451,7 @@ pipeline {
                 def nm = new NotificationManager(this)
                 nm.sendSlack('UNSTABLE', buildDetails())
                 emailext(
-                    subject           : "UNSTABLE: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    subject           : "⚠️ UNSTABLE: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body              : buildEmailBody('UNSTABLE'),
                     mimeType          : 'text/html',
                     to                : params.RECIPIENTS,
@@ -336,33 +490,44 @@ def buildDetails() {
 def buildEmailBody(String status) {
     def color = status == 'SUCCESS' ? '#28a745' :
                 status == 'FAILURE' ? '#dc3545' : '#ffc107'
+    def icon = status == 'SUCCESS' ? '✅' : status == 'FAILURE' ? '❌' : '⚠️'
     return """
 <!DOCTYPE html><html><body style="font-family:Arial,sans-serif;padding:20px;">
 <div style="background:${color};padding:15px;border-radius:8px;margin-bottom:20px;">
-  <h2 style="color:white;margin:0;">${status}: ${env.JOB_NAME} #${env.BUILD_NUMBER}</h2>
+  <h2 style="color:white;margin:0;">${icon} ${status}: ${env.JOB_NAME} #${env.BUILD_NUMBER}</h2>
 </div>
 <table style="width:100%;border-collapse:collapse;">
   <tr style="background:#f2f2f2;">
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Service</td>
-    <td style="padding:8px;border:1px solid #ddd;">${SERVICE}</td></tr>
-  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Version</td>
-    <td style="padding:8px;border:1px solid #ddd;">${params.VERSION}</td></tr>
+    <td style="padding:8px;border:1px solid #ddd;">${SERVICE}</td>
+  </tr>
+  <tr>
+    <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Version</td>
+    <td style="padding:8px;border:1px solid #ddd;">${params.VERSION}</td>
+  </tr>
   <tr style="background:#f2f2f2;">
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Environment</td>
-    <td style="padding:8px;border:1px solid #ddd;">${params.ENVIRONMENT}</td></tr>
-  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Branch</td>
-    <td style="padding:8px;border:1px solid #ddd;">${env.BRANCH}</td></tr>
+    <td style="padding:8px;border:1px solid #ddd;">${params.ENVIRONMENT}</td>
+  </tr>
+  <tr>
+    <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Branch</td>
+    <td style="padding:8px;border:1px solid #ddd;">${env.BRANCH}</td>
+  </tr>
   <tr style="background:#f2f2f2;">
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Duration</td>
-    <td style="padding:8px;border:1px solid #ddd;">${currentBuild.durationString}</td></tr>
-  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Build URL</td>
+    <td style="padding:8px;border:1px solid #ddd;">${currentBuild.durationString}</td>
+  </tr>
+  <tr>
+    <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Build URL</td>
     <td style="padding:8px;border:1px solid #ddd;">
-      <a href="${env.BUILD_URL}">View Build Logs</a></td></tr>
+      <a href="${env.BUILD_URL}">🔗 View Build Logs</a>
+    </td>
+  </tr>
 </table>
 <p style="margin-top:15px;padding:10px;background:#f8f9fa;border-radius:5px;">
-  Test Report PDF attached. Coverage HTML report available in Jenkins.
+  📊 Test Report PDF attached.<br>
+  📈 Coverage HTML report available in Jenkins.
 </p>
 </body></html>
     """
 }
-
