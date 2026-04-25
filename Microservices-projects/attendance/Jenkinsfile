@@ -3,6 +3,17 @@
 import org.example.BlueGreenDeployment
 import org.example.NotificationManager
 
+// ══════════════════════════════════════════════════════════════
+//  Multi-Environment Blue-Green Deployment Pipeline
+//  Assignment-5 Complete:
+//    ✅ Dev auto-deploy (no approval)
+//    ✅ Manual approval for Staging & Prod (input + milestone)
+//    ✅ Blue-Green deployment logic for Prod
+//    ✅ Health check: kubectl exec → localhost:8081/attendance/healthz
+//    ✅ Automatic rollback on health check failure
+//    ✅ Milestone for concurrency control
+// ══════════════════════════════════════════════════════════════
+
 pipeline {
     agent any
 
@@ -244,8 +255,8 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // STAGE 9: Test Dev — health check
-        //   ✅ Fixed: port=8081, path=/attendance/healthz
-        //   Label: app=attendance,slot=blue
+        //   ✅ port=8081, path=/attendance/healthz
+        //   ✅ Sets HEALTH_CHECK_FAILED for auto-rollback
         // ─────────────────────────────────────────────
         stage('Test Dev') {
             when {
@@ -266,7 +277,7 @@ pipeline {
                                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
                             if [ -z "\$POD" ]; then
                                 echo "WARNING: No running pod found in dev"
-                                exit 0
+                                exit 1
                             fi
                             echo "Checking pod: \$POD"
                             kubectl exec -n dev "\$POD" -- \
@@ -276,10 +287,23 @@ pipeline {
                         returnStatus: true
                     )
                     if (result != 0) {
-                        echo "WARNING: Dev health check failed. Marking UNSTABLE."
-                        currentBuild.result = 'UNSTABLE'
+                        // ✅ Auto-rollback trigger: set flag + rollback immediately
+                        env.HEALTH_CHECK_FAILED = 'true'
+                        env.FAILED_NAMESPACE    = 'dev'
+                        echo "❌ Dev health check FAILED — triggering auto-rollback"
+                        // Rollback dev deployment to previous revision
+                        sh """
+                            echo "=== AUTO-ROLLBACK: Dev ==="
+                            kubectl rollout undo deployment/attendance-blue --namespace=dev
+                            kubectl rollout status deployment/attendance-blue \
+                                --namespace=dev --timeout=120s
+                            echo "Dev rollback complete."
+                        """
+                        currentBuild.result = 'FAILURE'
+                        error("Dev health check failed — rolled back and aborting pipeline")
                     } else {
-                        echo "Dev health check PASSED."
+                        env.HEALTH_CHECK_FAILED = 'false'
+                        echo "✅ Dev health check PASSED."
                     }
                 }
             }
@@ -288,6 +312,7 @@ pipeline {
         // ─────────────────────────────────────────────
         // STAGE 10: Manual Approval — Staging / Prod
         //   milestone(1) → input → milestone(2)
+        //   ✅ Concurrency control via milestone
         // ─────────────────────────────────────────────
         stage('Approval for Staging / Prod') {
             when {
@@ -302,7 +327,7 @@ pipeline {
             }
             steps {
                 script {
-                    // milestone: cancels older builds waiting at this gate
+                    // ✅ milestone: if newer build reaches here, older build is cancelled
                     milestone ordinal: 1
 
                     input message: "Deploy ${SERVICE}:${params.VERSION} to ${params.ENVIRONMENT} ?",
@@ -342,8 +367,8 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // STAGE 12: Test Staging — health check
-        //   ✅ Fixed: port=8081, path=/attendance/healthz
-        //   Label: app=attendance,slot=blue
+        //   ✅ port=8081, path=/attendance/healthz
+        //   ✅ Auto-rollback on failure (undo deployment)
         // ─────────────────────────────────────────────
         stage('Test Staging') {
             when {
@@ -364,7 +389,7 @@ pipeline {
                                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
                             if [ -z "\$POD" ]; then
                                 echo "WARNING: No running pod found in staging"
-                                exit 0
+                                exit 1
                             fi
                             echo "Checking pod: \$POD"
                             kubectl exec -n staging "\$POD" -- \
@@ -374,10 +399,22 @@ pipeline {
                         returnStatus: true
                     )
                     if (result != 0) {
-                        echo "WARNING: Staging health check failed. Marking UNSTABLE."
-                        currentBuild.result = 'UNSTABLE'
+                        // ✅ Auto-rollback: undo the staging deployment
+                        env.HEALTH_CHECK_FAILED = 'true'
+                        env.FAILED_NAMESPACE    = 'staging'
+                        echo "❌ Staging health check FAILED — triggering auto-rollback"
+                        sh """
+                            echo "=== AUTO-ROLLBACK: Staging ==="
+                            kubectl rollout undo deployment/attendance-blue --namespace=staging
+                            kubectl rollout status deployment/attendance-blue \
+                                --namespace=staging --timeout=120s
+                            echo "Staging rollback complete. Previous version restored."
+                        """
+                        currentBuild.result = 'FAILURE'
+                        error("Staging health check failed — rolled back and aborting pipeline")
                     } else {
-                        echo "Staging health check PASSED."
+                        env.HEALTH_CHECK_FAILED = 'false'
+                        echo "✅ Staging health check PASSED."
                     }
                 }
             }
@@ -385,8 +422,8 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // STAGE 13: Blue-Green Deploy to Prod (idle slot)
-        //   Finds live slot → deploys to idle slot
-        //   Traffic NOT switched yet (Blue still live)
+        //   ✅ Finds live slot dynamically
+        //   ✅ Deploys to idle slot — live slot unchanged
         // ─────────────────────────────────────────────
         stage('Deploy to Green (Prod Blue-Green)') {
             when {
@@ -425,8 +462,8 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // STAGE 14: Health Check — idle slot (5 retries)
-        //   ✅ Fixed: port=8081, path=/attendance/healthz
-        //   Label: app=attendance,slot=<idleSlot>
+        //   ✅ port=8081, path=/attendance/healthz
+        //   ✅ Sets HEALTH_CHECK_FAILED for Rollback stage
         // ─────────────────────────────────────────────
         stage('Health Check - Green Slot') {
             when {
@@ -461,21 +498,22 @@ pipeline {
                             returnStatus: true
                         )
                         if (result == 0) {
-                            echo "Health check attempt ${i}/5: PASSED"
+                            echo "✅ Health check attempt ${i}/5: PASSED"
                             passed = true
                             break
                         }
-                        echo "Health check attempt ${i}/5: FAILED"
+                        echo "❌ Health check attempt ${i}/5: FAILED"
                         if (i < 5) { sleep(time: 10, unit: 'SECONDS') }
                     }
 
                     if (!passed) {
                         env.HEALTH_CHECK_FAILED = 'true'
-                        echo "WARNING: Health check FAILED after 5 attempts. Will rollback."
+                        echo "❌ Health check FAILED after 5 attempts — Rollback stage will execute."
+                        // Don't switch traffic — Rollback stage keeps live slot active
                         currentBuild.result = 'UNSTABLE'
                     } else {
                         env.HEALTH_CHECK_FAILED = 'false'
-                        echo "Health check PASSED. Ready to switch traffic."
+                        echo "✅ Health check PASSED. Ready to switch traffic."
                     }
                 }
             }
@@ -483,7 +521,7 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // STAGE 15: Switch Traffic → idle slot goes live
-        //   Only runs if health check PASSED
+        //   Only runs if HEALTH_CHECK_FAILED == 'false'
         // ─────────────────────────────────────────────
         stage('Switch Traffic to Green') {
             when {
@@ -501,14 +539,21 @@ pipeline {
                             --type=json \
                             -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.IDLE_SLOT}"}]'
                     """
-                    echo "Traffic switched! ${env.IDLE_SLOT} is now LIVE. ${env.LIVE_SLOT} is standby."
+                    echo "✅ Traffic switched! ${env.IDLE_SLOT} is now LIVE. ${env.LIVE_SLOT} is standby."
                 }
             }
         }
 
         // ─────────────────────────────────────────────
         // STAGE 16: Rollback
-        //   Manual (ROLLBACK=true) OR auto (health check failed)
+        //   Triggers when:
+        //     A) params.ROLLBACK = true  (manual rollback)
+        //     B) HEALTH_CHECK_FAILED = 'true' (auto-rollback after prod health failure)
+        //
+        //   Prod:    service selector stays on LIVE_SLOT (no switch happened)
+        //            idle slot image reverted via kubectl rollout undo
+        //   Staging: kubectl rollout undo (handled in Test Staging stage itself)
+        //   Manual:  switches svc selector to other slot
         // ─────────────────────────────────────────────
         stage('Rollback') {
             when {
@@ -520,6 +565,7 @@ pipeline {
             steps {
                 script {
                     if (params.ROLLBACK) {
+                        // ── Manual rollback ──────────────────────────────
                         def ns = params.ENVIRONMENT
                         echo "=== MANUAL ROLLBACK on ${ns} ==="
                         sh """
@@ -530,15 +576,30 @@ pipeline {
                             kubectl patch svc ${SERVICE} -n ${ns} \
                                 --type=json \
                                 -p '[{"op":"replace","path":"/spec/selector/slot","value":"'"\$PREV"'"}]'
+                            echo "Manual rollback complete. \$PREV is now live."
                         """
+
                     } else {
-                        echo "=== AUTO ROLLBACK: keeping ${env.LIVE_SLOT} as live ==="
+                        // ── Auto-rollback after prod health check failure ─
+                        def liveSlot = env.LIVE_SLOT
+                        def idleSlot = env.IDLE_SLOT
+                        echo "=== AUTO-ROLLBACK: Prod health check failed ==="
+                        echo "Traffic was never switched — ${liveSlot} is still serving."
+                        echo "Reverting ${idleSlot} slot image to previous revision..."
                         sh """
-                            kubectl patch svc ${SERVICE} -n prod \
-                                --type=json \
-                                -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.LIVE_SLOT}"}]'
+                            kubectl rollout undo deployment/${SERVICE}-${idleSlot} -n prod
+                            kubectl rollout status deployment/${SERVICE}-${idleSlot} \
+                                -n prod --timeout=120s
+
+                            echo ""
+                            echo "=== Rollback Summary ==="
+                            echo "Live slot (unchanged): ${liveSlot}"
+                            echo "Idle slot reverted:    ${idleSlot}"
+                            kubectl get svc ${SERVICE} -n prod \
+                                -o jsonpath='Service selector slot: {.spec.selector.slot}'
+                            echo ""
                         """
-                        echo "Rollback done. ${env.LIVE_SLOT} is still serving traffic."
+                        echo "✅ Auto-rollback complete. ${liveSlot} continues serving traffic."
                     }
                 }
             }
@@ -575,6 +636,8 @@ pipeline {
 
     // ─────────────────────────────────────────────────
     // POST ACTIONS
+    //   ✅ Auto-rollback safety net for prod on FAILURE
+    //      (catches unexpected failures before Rollback stage)
     // ─────────────────────────────────────────────────
     post {
         always {
@@ -603,14 +666,16 @@ pipeline {
         failure {
             script {
                 echo "=== POST: FAILURE ==="
-                // Auto-rollback on prod failure — revert to last known live slot
+                // ✅ Safety net: if prod failed unexpectedly after traffic may have
+                //    switched, revert selector back to original live slot
                 if (params.ENVIRONMENT == 'prod' && env.LIVE_SLOT) {
-                    echo "=== PROD FAILURE: Auto-rollback to ${env.LIVE_SLOT} ==="
+                    echo "=== POST AUTO-ROLLBACK SAFETY NET: Prod → reverting to ${env.LIVE_SLOT} ==="
                     sh """
                         kubectl patch svc ${SERVICE} -n prod \
                             --type=json \
                             -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.LIVE_SLOT}"}]' \
                             || true
+                        echo "Service selector restored to: ${env.LIVE_SLOT}"
                     """
                 }
                 def nm = new NotificationManager(this)
