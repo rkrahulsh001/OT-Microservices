@@ -33,6 +33,9 @@ pipeline {
 
     stages {
 
+        // ─────────────────────────────────────────────
+        // STAGE 1: Notify Start
+        // ─────────────────────────────────────────────
         stage('Notify Start') {
             steps {
                 script {
@@ -43,17 +46,22 @@ pipeline {
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 2: Validate
+        // ─────────────────────────────────────────────
         stage('Validate') {
             when { expression { !params.ROLLBACK } }
             steps {
                 script {
                     def dm = new DeploymentManager(this)
-                    dm.validateConfig(
-                        SERVICE, params.ENVIRONMENT, params.VERSION)
+                    dm.validateConfig(SERVICE, params.ENVIRONMENT, params.VERSION)
                 }
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 3: Setup Test Environment
+        // ─────────────────────────────────────────────
         stage('Setup Test Environment') {
             when { expression { !params.ROLLBACK } }
             steps {
@@ -66,6 +74,9 @@ pipeline {
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 4: Parallel Tests
+        // ─────────────────────────────────────────────
         stage('Parallel Tests') {
             when { expression { !params.ROLLBACK } }
             parallel {
@@ -73,8 +84,7 @@ pipeline {
                 stage('Unit Tests') {
                     steps {
                         dir("${TEST_DIR}") {
-                            catchError(buildResult: 'UNSTABLE',
-                                       stageResult: 'FAILURE') {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                                 sh """
                                     python3 -m pytest test_unit.py \
                                         -v \
@@ -101,8 +111,7 @@ pipeline {
                 stage('Integration Tests') {
                     steps {
                         dir("${TEST_DIR}") {
-                            catchError(buildResult: 'UNSTABLE',
-                                       stageResult: 'FAILURE') {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                                 sh '''
                                     python3 -m pytest test_integration.py \
                                         -v \
@@ -117,8 +126,7 @@ pipeline {
                     post {
                         always {
                             junit allowEmptyResults: true,
-                                  testResults: \
-                                  "${TEST_DIR}/integration-results.xml"
+                                  testResults: "${TEST_DIR}/integration-results.xml"
                         }
                     }
                 }
@@ -126,8 +134,7 @@ pipeline {
                 stage('Code Quality') {
                     steps {
                         dir("${TEST_DIR}") {
-                            catchError(buildResult: 'UNSTABLE',
-                                       stageResult: 'FAILURE') {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                                 sh '''
                                     flake8 attendance_api.py \
                                         --max-line-length=120 \
@@ -149,12 +156,14 @@ pipeline {
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 5: Coverage Report
+        // ─────────────────────────────────────────────
         stage('Coverage Report') {
             when { expression { !params.ROLLBACK } }
             steps {
                 dir("${TEST_DIR}") {
-                    catchError(buildResult: 'UNSTABLE',
-                               stageResult: 'FAILURE') {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                         sh """
                             echo "=== Coverage Summary ==="
                             python3 -m coverage report \
@@ -166,21 +175,34 @@ pipeline {
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 6: Generate PDF Report
+        // ─────────────────────────────────────────────
         stage('Generate PDF Report') {
             when { expression { !params.ROLLBACK } }
             steps {
                 dir("${TEST_DIR}") {
                     sh """
+                        echo "=== Files before PDF generation ==="
+                        ls -la *.xml *.log *.txt 2>/dev/null || true
+
                         export VERSION=${params.VERSION}
                         export ENVIRONMENT=${params.ENVIRONMENT}
                         export GIT_BRANCH=${env.BRANCH}
                         export BUILD_NUMBER=${env.BUILD_NUMBER}
+
                         python3 generate_report.py
+
+                        echo "=== PDF Info ==="
+                        ls -la test-report.pdf
                     """
                 }
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 7: Publish Reports
+        // ─────────────────────────────────────────────
         stage('Publish Reports') {
             when { expression { !params.ROLLBACK } }
             steps {
@@ -203,30 +225,30 @@ pipeline {
             }
         }
 
-        // ============ DEV ENVIRONMENT ============
+        // ─────────────────────────────────────────────
+        // STAGE 8: Deploy to Dev (AUTO - no approval)
+        // ─────────────────────────────────────────────
         stage('Deploy to Dev') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
                     expression { params.ENVIRONMENT == 'dev' }
+                    expression { currentBuild.currentResult != 'FAILURE' }
                 }
             }
             steps {
                 script {
-                    sh """
-                        kubectl set image deployment/attendance-blue \
-                              attendance=attendance:${params.VERSION} -n dev
-                        kubectl set image deployment/attendance-green \
-                              attendance=attendance:${params.VERSION} -n dev
-                        kubectl rollout status deployment/attendance-blue -n dev --timeout=120s
-                        kubectl rollout status deployment/attendance-green -n dev --timeout=120s
-                    """
-                    echo "✅ Dev deployment complete"
+                    echo "=== AUTO DEPLOY: Dev environment ==="
+                    def dm = new DeploymentManager(this)
+                    dm.deploy(SERVICE, 'dev', params.VERSION)
                 }
             }
         }
 
-        stage('Health Check - Dev') {
+        // ─────────────────────────────────────────────
+        // STAGE 9: Test Dev (health check after dev deploy)
+        // ─────────────────────────────────────────────
+        stage('Test Dev') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
@@ -235,62 +257,95 @@ pipeline {
             }
             steps {
                 script {
+                    echo "=== Verifying Dev deployment health ==="
+                    sleep(time: 10, unit: 'SECONDS')
+                    def devUrl = sh(
+                        script: "kubectl get svc attendance -n dev -o jsonpath='{.spec.clusterIP}'",
+                        returnStdout: true
+                    ).trim()
                     try {
-                        // Get service IP directly without port-forwarding
-                        def svc_ip = sh(script: "kubectl get svc attendance -n dev -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
-                        sh "curl -f --max-time 10 http://${svc_ip}/health"
-                        echo "✅ Dev health check passed"
-                    } catch (e) {
-                        // Try alternative: check pod logs if service not accessible
-                        sh "kubectl logs -n dev deployment/attendance-blue --tail=20"
-                        error "❌ Dev health check failed: ${e.message}"
+                        def response = httpRequest(
+                            url            : "http://${devUrl}/health",
+                            validResponseCodes: '200',
+                            timeout        : 30,
+                            consoleLogResponseBody: true
+                        )
+                        echo "Dev health check passed: ${response.status}"
+                    } catch (Exception e) {
+                        echo "WARNING: Dev health check failed: ${e.message}"
+                        currentBuild.result = 'UNSTABLE'
                     }
                 }
             }
         }
 
-        // ============ STAGING ENVIRONMENT ============
-        stage('Manual Approval for Staging') {
+        // ─────────────────────────────────────────────
+        // STAGE 10: Manual Approval for Staging/Prod
+        //           (input step + milestone)
+        // ─────────────────────────────────────────────
+        stage('Approval for Staging / Prod') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
-                    expression { params.ENVIRONMENT == 'staging' }
+                    anyOf {
+                        expression { params.ENVIRONMENT == 'staging' }
+                        expression { params.ENVIRONMENT == 'prod' }
+                    }
+                    expression { currentBuild.currentResult != 'FAILURE' }
                 }
             }
-            options {
-                timeout(time: 30, unit: 'MINUTES')
-            }
             steps {
-                input message: '🚀 Deploy to Staging?',
-                      ok: 'Yes, deploy to Staging',
-                      submitter: 'admin,devops-team'
+                script {
+                    // milestone prevents older builds from overtaking newer ones
+                    milestone(label: 'pre-approval', ordinal: 1)
+
+                    def approver = input(
+                        message : "Deploy attendance:${params.VERSION} to ${params.ENVIRONMENT.toUpperCase()}?",
+                        ok      : "Yes, Deploy!",
+                        submitter: 'admin,rahul',
+                        parameters: [
+                            choice(
+                                name       : 'CONFIRM',
+                                choices    : ['Approve', 'Reject'],
+                                description: 'Select action'
+                            )
+                        ]
+                    )
+
+                    if (approver['CONFIRM'] != 'Approve') {
+                        error("Deployment rejected by approver.")
+                    }
+
+                    milestone(label: 'post-approval', ordinal: 2)
+                    echo "Deployment approved. Proceeding to ${params.ENVIRONMENT}..."
+                }
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 11: Deploy to Staging
+        // ─────────────────────────────────────────────
         stage('Deploy to Staging') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
                     expression { params.ENVIRONMENT == 'staging' }
+                    expression { currentBuild.currentResult != 'FAILURE' }
                 }
             }
             steps {
-                milestone(1)
                 script {
-                    sh """
-                        kubectl set image deployment/attendance-blue \
-                              attendance=attendance:${params.VERSION} -n staging
-                        kubectl set image deployment/attendance-green \
-                              attendance=attendance:${params.VERSION} -n staging
-                        kubectl rollout status deployment/attendance-blue -n staging --timeout=120s
-                        kubectl rollout status deployment/attendance-green -n staging --timeout=120s
-                    """
-                    echo "✅ Staging deployment complete"
+                    echo "=== Deploying to Staging ==="
+                    def dm = new DeploymentManager(this)
+                    dm.deploy(SERVICE, 'staging', params.VERSION)
                 }
             }
         }
 
-        stage('Health Check - Staging') {
+        // ─────────────────────────────────────────────
+        // STAGE 12: Test Staging
+        // ─────────────────────────────────────────────
+        stage('Test Staging') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
@@ -299,58 +354,72 @@ pipeline {
             }
             steps {
                 script {
+                    echo "=== Verifying Staging deployment health ==="
+                    sleep(time: 15, unit: 'SECONDS')
+                    def stagingUrl = sh(
+                        script: "kubectl get svc attendance -n staging -o jsonpath='{.spec.clusterIP}'",
+                        returnStdout: true
+                    ).trim()
                     try {
-                        def svc_ip = sh(script: "kubectl get svc attendance -n staging -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
-                        retry(3) {
-                            sleep 5
-                            sh "curl -f --max-time 10 http://${svc_ip}/health"
-                        }
-                        echo "✅ Staging health check passed"
-                    } catch (e) {
-                        error "❌ Staging health check failed: ${e.message}"
+                        def response = httpRequest(
+                            url               : "http://${stagingUrl}/health",
+                            validResponseCodes: '200',
+                            timeout           : 30,
+                            consoleLogResponseBody: true
+                        )
+                        echo "Staging health check passed: ${response.status}"
+                    } catch (Exception e) {
+                        error("Staging health check FAILED: ${e.message}")
                     }
                 }
             }
         }
 
-        // ============ PRODUCTION ENVIRONMENT (Blue-Green) ============
-        stage('Manual Approval for Production') {
+        // ─────────────────────────────────────────────
+        // STAGE 13: Blue-Green Deploy to Production
+        //           (deploy to idle/green slot)
+        // ─────────────────────────────────────────────
+        stage('Deploy to Green (Prod Blue-Green)') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
                     expression { params.ENVIRONMENT == 'prod' }
-                }
-            }
-            options {
-                timeout(time: 30, unit: 'MINUTES')
-            }
-            steps {
-                input message: '🔴 Deploy to PRODUCTION?',
-                      ok: 'Yes, deploy to Production',
-                      submitter: 'admin,devops-team'
-            }
-        }
-
-        stage('Deploy to Green (Prod)') {
-            when {
-                allOf {
-                    expression { !params.ROLLBACK }
-                    expression { params.ENVIRONMENT == 'prod' }
+                    expression { currentBuild.currentResult != 'FAILURE' }
                 }
             }
             steps {
                 script {
+                    echo "=== Blue-Green: Finding idle slot ==="
+
+                    // Find current live slot
+                    def liveSlot = sh(
+                        script: "kubectl get svc ${SERVICE} -n prod -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo 'blue'",
+                        returnStdout: true
+                    ).trim()
+
+                    def idleSlot = (liveSlot == 'blue') ? 'green' : 'blue'
+                    echo "Live slot: ${liveSlot} | Deploying to idle slot: ${idleSlot}"
+                    env.LIVE_SLOT = liveSlot
+                    env.IDLE_SLOT = idleSlot
+
+                    // Update idle deployment image
                     sh """
-                        kubectl set image deployment/attendance-green \
-                              attendance=attendance:${params.VERSION} -n prod
-                        kubectl rollout status deployment/attendance-green -n prod --timeout=180s
+                        kubectl set image deployment/${SERVICE}-${idleSlot} \
+                            ${SERVICE}=${SERVICE}:${params.VERSION} \
+                            -n prod
+
+                        kubectl rollout status deployment/${SERVICE}-${idleSlot} \
+                            -n prod --timeout=120s
                     """
-                    echo "✅ Green deployment updated"
+                    echo "New version deployed to ${idleSlot} slot successfully."
                 }
             }
         }
 
-        stage('Health Check - Green') {
+        // ─────────────────────────────────────────────
+        // STAGE 14: Health Check on Green slot
+        // ─────────────────────────────────────────────
+        stage('Health Check - Green Slot') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
@@ -359,95 +428,117 @@ pipeline {
             }
             steps {
                 script {
-                    try {
-                        def green_svc_ip = sh(script: "kubectl get svc attendance-green -n prod -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
-                        retry(3) {
-                            sleep 10
-                            sh "curl -f --max-time 10 http://${green_svc_ip}/health"
+                    echo "=== Running health check on idle slot: ${env.IDLE_SLOT} ==="
+                    sleep(time: 15, unit: 'SECONDS')
+
+                    def greenSvcIp = sh(
+                        script: "kubectl get svc ${SERVICE}-${env.IDLE_SLOT} -n prod -o jsonpath='{.spec.clusterIP}'",
+                        returnStdout: true
+                    ).trim()
+
+                    def maxRetries = 5
+                    def passed     = false
+
+                    for (int i = 1; i <= maxRetries; i++) {
+                        try {
+                            def response = httpRequest(
+                                url               : "http://${greenSvcIp}/health",
+                                validResponseCodes: '200',
+                                timeout           : 20,
+                                consoleLogResponseBody: true
+                            )
+                            echo "Health check attempt ${i}/${maxRetries}: PASSED (${response.status})"
+                            passed = true
+                            break
+                        } catch (Exception e) {
+                            echo "Health check attempt ${i}/${maxRetries}: FAILED - ${e.message}"
+                            if (i < maxRetries) sleep(time: 10, unit: 'SECONDS')
                         }
-                        echo "✅ Green deployment health check passed"
-                    } catch (e) {
-                        error "❌ Green health check failed - keeping blue active"
                     }
+
+                    if (!passed) {
+                        env.HEALTH_CHECK_FAILED = 'true'
+                        error("Health check FAILED after ${maxRetries} attempts. Triggering rollback...")
+                    }
+
+                    env.HEALTH_CHECK_FAILED = 'false'
+                    echo "Health check PASSED. Ready to switch traffic."
                 }
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 15: Switch Traffic → Green becomes Live
+        // ─────────────────────────────────────────────
         stage('Switch Traffic to Green') {
             when {
                 allOf {
                     expression { !params.ROLLBACK }
                     expression { params.ENVIRONMENT == 'prod' }
+                    expression { env.HEALTH_CHECK_FAILED == 'false' }
                 }
             }
             steps {
                 script {
+                    echo "=== Switching traffic: ${env.LIVE_SLOT} → ${env.IDLE_SLOT} ==="
                     sh """
-                        kubectl patch svc attendance -n prod -p '{"spec":{"selector":{"slot":"green"}}}'
-                        echo "✅ Traffic switched to green deployment"
+                        kubectl patch svc ${SERVICE} -n prod \
+                            --type=json \
+                            -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.IDLE_SLOT}"}]'
                     """
+                    echo "Traffic switched! ${env.IDLE_SLOT} slot is now LIVE."
+                    echo "Previous live slot (${env.LIVE_SLOT}) is now idle/standby."
                 }
             }
         }
 
-        stage('Verify Production') {
-            when {
-                allOf {
-                    expression { !params.ROLLBACK }
-                    expression { params.ENVIRONMENT == 'prod' }
-                }
-            }
-            steps {
-                script {
-                    try {
-                        def svc_ip = sh(script: "kubectl get svc attendance -n prod -o jsonpath='{.spec.clusterIP}'", returnStdout: true).trim()
-                        sh "curl -f --max-time 10 http://${svc_ip}/health"
-                        echo "✅ Production verified - green is live"
-                    } catch (e) {
-                        // Don't fail here, just warn
-                        echo "⚠️ Production verification warning: ${e.message}"
-                    }
-                }
-            }
-        }
-
-        // ============ ROLLBACK STAGE ============
+        // ─────────────────────────────────────────────
+        // STAGE 16: Rollback (manual trigger or auto)
+        // ─────────────────────────────────────────────
         stage('Rollback') {
-            when { expression { params.ROLLBACK } }
+            when {
+                anyOf {
+                    expression { params.ROLLBACK }
+                    expression { env.HEALTH_CHECK_FAILED == 'true' }
+                }
+            }
             steps {
                 script {
-                    if (params.ENVIRONMENT == 'prod') {
-                        sh """
-                            kubectl patch svc attendance -n prod -p '{"spec":{"selector":{"slot":"blue"}}}'
-                            echo "✅ Rollback complete - traffic switched to blue"
-                        """
+                    if (params.ROLLBACK) {
+                        // Manual rollback via parameter
+                        echo "=== MANUAL ROLLBACK triggered ==="
+                        def dm = new DeploymentManager(this)
+                        dm.rollback(SERVICE, params.ENVIRONMENT)
                     } else {
+                        // Auto rollback - health check failed
+                        echo "=== AUTO ROLLBACK: Health check failed. Keeping ${env.LIVE_SLOT} as live ==="
                         sh """
-                            kubectl rollout undo deployment/attendance-blue -n ${params.ENVIRONMENT}
-                            kubectl rollout undo deployment/attendance-green -n ${params.ENVIRONMENT}
-                            echo "✅ Rollback complete for ${params.ENVIRONMENT}"
+                            kubectl patch svc ${SERVICE} -n prod \
+                                --type=json \
+                                -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.LIVE_SLOT}"}]'
                         """
+                        echo "Rollback complete. ${env.LIVE_SLOT} slot is still serving traffic."
                     }
                 }
             }
         }
 
+        // ─────────────────────────────────────────────
+        // STAGE 17: Final Status
+        // ─────────────────────────────────────────────
         stage('Final Status') {
             steps {
                 script {
-                    echo "=== FINAL STATUS ==="
-                    sh "kubectl get pods -n ${params.ENVIRONMENT}"
-                    sh "kubectl get svc -n ${params.ENVIRONMENT}"
-                    
-                    if (params.ENVIRONMENT == 'prod') {
-                        def activeSlot = sh(script: "kubectl get svc attendance -n prod -o jsonpath='{.spec.selector.slot}'", returnStdout: true).trim()
-                        echo "Active slot in production: ${activeSlot}"
-                    }
+                    def bg = new BlueGreenDeployment(this)
+                    bg.finalStatus(SERVICE, params.ENVIRONMENT)
                 }
             }
         }
     }
 
+    // ─────────────────────────────────────────────────
+    // POST ACTIONS
+    // ─────────────────────────────────────────────────
     post {
         always {
             echo "=== POST: ALWAYS ==="
@@ -463,7 +554,7 @@ pipeline {
                 nm.sendSlack('SUCCESS', buildDetails())
                 nm.sendTeams('SUCCESS', buildDetails())
                 emailext(
-                    subject           : "✅ SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    subject           : "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} | ${params.ENVIRONMENT.toUpperCase()} | Coverage Attached",
                     body              : buildEmailBody('SUCCESS'),
                     mimeType          : 'text/html',
                     to                : params.RECIPIENTS,
@@ -475,17 +566,21 @@ pipeline {
         failure {
             echo "=== POST: FAILURE ==="
             script {
-                // Auto-rollback for prod failures
-                if (params.ENVIRONMENT == 'prod' && !params.ROLLBACK && currentBuild.currentResult == 'FAILURE') {
-                    sh "kubectl patch svc attendance -n prod -p '{\"spec\":{\"selector\":{\"slot\":\"blue\"}}}'"
-                    echo "🔄 Auto-rollback: Traffic switched to blue due to failure"
+                // Auto rollback on prod failure
+                if (params.ENVIRONMENT == 'prod' && env.LIVE_SLOT) {
+                    echo "=== PROD FAILURE: Auto-rollback to ${env.LIVE_SLOT} ==="
+                    sh """
+                        kubectl patch svc ${SERVICE} -n prod \
+                            --type=json \
+                            -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.LIVE_SLOT}"}]' \
+                            || true
+                    """
                 }
-                
                 def nm = new NotificationManager(this)
                 nm.sendSlack('FAILURE', buildDetails())
                 nm.sendTeams('FAILURE', buildDetails())
                 emailext(
-                    subject           : "❌ FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    subject           : "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER} | ${params.ENVIRONMENT.toUpperCase()}",
                     body              : buildEmailBody('FAILURE'),
                     mimeType          : 'text/html',
                     to                : params.RECIPIENTS,
@@ -501,7 +596,7 @@ pipeline {
                 def nm = new NotificationManager(this)
                 nm.sendSlack('UNSTABLE', buildDetails())
                 emailext(
-                    subject           : "⚠️ UNSTABLE: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    subject           : "UNSTABLE: ${env.JOB_NAME} #${env.BUILD_NUMBER} | ${params.ENVIRONMENT.toUpperCase()}",
                     body              : buildEmailBody('UNSTABLE'),
                     mimeType          : 'text/html',
                     to                : params.RECIPIENTS,
@@ -512,6 +607,9 @@ pipeline {
     }
 }
 
+// ─────────────────────────────────────────────────────
+// HELPER FUNCTIONS
+// ─────────────────────────────────────────────────────
 def buildDetails() {
     def changesList = []
     try {
@@ -540,43 +638,34 @@ def buildDetails() {
 def buildEmailBody(String status) {
     def color = status == 'SUCCESS' ? '#28a745' :
                 status == 'FAILURE' ? '#dc3545' : '#ffc107'
-    def icon = status == 'SUCCESS' ? '✅' : status == 'FAILURE' ? '❌' : '⚠️'
     return """
 <!DOCTYPE html><html><body style="font-family:Arial,sans-serif;padding:20px;">
 <div style="background:${color};padding:15px;border-radius:8px;margin-bottom:20px;">
-  <h2 style="color:white;margin:0;">${icon} ${status}: ${env.JOB_NAME} #${env.BUILD_NUMBER}</h2>
+  <h2 style="color:white;margin:0;">${status}: ${env.JOB_NAME} #${env.BUILD_NUMBER}</h2>
 </div>
 <table style="width:100%;border-collapse:collapse;">
   <tr style="background:#f2f2f2;">
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Service</td>
-    <td style="padding:8px;border:1px solid #ddd;">${SERVICE}</td>
-  </tr>
-  <tr>
-    <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Version</td>
-    <td style="padding:8px;border:1px solid #ddd;">${params.VERSION}</td>
-  </tr>
+    <td style="padding:8px;border:1px solid #ddd;">${SERVICE}</td></tr>
+  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Version</td>
+    <td style="padding:8px;border:1px solid #ddd;">${params.VERSION}</td></tr>
   <tr style="background:#f2f2f2;">
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Environment</td>
-    <td style="padding:8px;border:1px solid #ddd;">${params.ENVIRONMENT}</td>
-  </tr>
-  <tr>
-    <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Branch</td>
-    <td style="padding:8px;border:1px solid #ddd;">${env.BRANCH}</td>
-  </tr>
+    <td style="padding:8px;border:1px solid #ddd;">${params.ENVIRONMENT}</td></tr>
+  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Branch</td>
+    <td style="padding:8px;border:1px solid #ddd;">${env.BRANCH}</td></tr>
   <tr style="background:#f2f2f2;">
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Duration</td>
-    <td style="padding:8px;border:1px solid #ddd;">${currentBuild.durationString}</td>
-  </tr>
-  <tr>
+    <td style="padding:8px;border:1px solid #ddd;">${currentBuild.durationString}</td></tr>
+  <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Live Slot</td>
+    <td style="padding:8px;border:1px solid #ddd;">${env.LIVE_SLOT ?: 'N/A'}</td></tr>
+  <tr style="background:#f2f2f2;">
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Build URL</td>
     <td style="padding:8px;border:1px solid #ddd;">
-      <a href="${env.BUILD_URL}">🔗 View Build Logs</a>
-    </td>
-   </tr>
+      <a href="${env.BUILD_URL}">View Build Logs</a></td></tr>
 </table>
 <p style="margin-top:15px;padding:10px;background:#f8f9fa;border-radius:5px;">
-  📊 Test Report PDF attached.<br>
-  📈 Coverage HTML report available in Jenkins.
+  Test Report PDF attached. Coverage HTML report available in Jenkins.
 </p>
 </body></html>
     """
