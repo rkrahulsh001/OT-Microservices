@@ -28,6 +28,10 @@ pipeline {
         COVERAGE_MIN = '50'
         TEST_DIR     = 'Microservices-projects/attendance'
         PATH         = "/var/lib/jenkins/.local/bin:${env.PATH}"
+
+        // ✅ Confirmed working health check endpoint
+        HEALTH_PORT  = '8081'
+        HEALTH_PATH  = '/attendance/healthz'
     }
 
     stages {
@@ -52,10 +56,7 @@ pipeline {
             when { expression { !params.ROLLBACK } }
             steps {
                 script {
-                    def svc = SERVICE
-                    def envName = params.ENVIRONMENT
-                    def ver = params.VERSION
-                    echo "Validating: service=${svc}, env=${envName}, version=${ver}"
+                    echo "Validating: service=${SERVICE}, env=${params.ENVIRONMENT}, version=${params.VERSION}"
                     echo "Validation passed"
                 }
             }
@@ -217,7 +218,6 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // STAGE 8: Deploy to Dev (AUTO — no approval)
-        //          Direct kubectl on attendance-blue
         // ─────────────────────────────────────────────
         stage('Deploy to Dev') {
             when {
@@ -229,12 +229,10 @@ pipeline {
             }
             steps {
                 script {
-                    def ver = params.VERSION
-                    def svc = SERVICE
-                    echo "=== AUTO DEPLOY to Dev (attendance-blue) — version: ${ver} ==="
+                    echo "=== AUTO DEPLOY to Dev (attendance-blue) — version: ${params.VERSION} ==="
                     sh """
                         kubectl set image deployment/attendance-blue \
-                            ${svc}=${svc}:${ver} \
+                            ${SERVICE}=${SERVICE}:${params.VERSION} \
                             --namespace=dev
                         kubectl rollout status deployment/attendance-blue \
                             --namespace=dev --timeout=120s
@@ -245,7 +243,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // STAGE 9: Test Dev — health check via pod exec
+        // STAGE 9: Test Dev — health check
+        //   ✅ Fixed: port=8081, path=/attendance/healthz
+        //   Label: app=attendance,slot=blue
         // ─────────────────────────────────────────────
         stage('Test Dev') {
             when {
@@ -256,26 +256,27 @@ pipeline {
             }
             steps {
                 script {
-                    echo "=== Dev Health Check ==="
+                    echo "=== Dev Health Check (port: ${HEALTH_PORT}, path: ${HEALTH_PATH}) ==="
                     sleep(time: 10, unit: 'SECONDS')
                     def result = sh(
-                        script: '''
-                            POD=$(kubectl get pod -n dev \
-                                -l app=attendance \
+                        script: """
+                            POD=\$(kubectl get pod -n dev \
+                                -l app=attendance,slot=blue \
                                 --field-selector=status.phase=Running \
                                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-                            if [ -z "$POD" ]; then
-                                echo "No running pod found, skipping"
+                            if [ -z "\$POD" ]; then
+                                echo "WARNING: No running pod found in dev"
                                 exit 0
                             fi
-                            echo "Checking pod: $POD"
-                            kubectl exec -n dev "$POD" -- \
-                                sh -c "curl -sf http://localhost/health || curl -sf http://localhost:5000/health || curl -sf http://localhost:8080/health" || true
-                        ''',
+                            echo "Checking pod: \$POD"
+                            kubectl exec -n dev "\$POD" -- \
+                                curl -sf --connect-timeout 10 \
+                                http://localhost:${HEALTH_PORT}${HEALTH_PATH}
+                        """,
                         returnStatus: true
                     )
                     if (result != 0) {
-                        echo "WARNING: Dev health check non-zero. Marking UNSTABLE."
+                        echo "WARNING: Dev health check failed. Marking UNSTABLE."
                         currentBuild.result = 'UNSTABLE'
                     } else {
                         echo "Dev health check PASSED."
@@ -286,8 +287,7 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // STAGE 10: Manual Approval — Staging / Prod
-        //           Simple input + milestone (sandbox-safe)
-        //           No map subscript, no toUpperCase in GString
+        //   milestone(1) → input → milestone(2)
         // ─────────────────────────────────────────────
         stage('Approval for Staging / Prod') {
             when {
@@ -302,24 +302,20 @@ pipeline {
             }
             steps {
                 script {
-                    def envName = params.ENVIRONMENT
-                    def ver     = params.VERSION
-
-                    // milestone: stops older builds overtaking newer ones
+                    // milestone: cancels older builds waiting at this gate
                     milestone ordinal: 1
 
-                    // "Yes, Deploy!" = proceed | "Abort" = cancel build
-                    input message: "Deploy ${SERVICE}:${ver} to ${envName} ?",
+                    input message: "Deploy ${SERVICE}:${params.VERSION} to ${params.ENVIRONMENT} ?",
                           ok: "Yes, Deploy!"
 
                     milestone ordinal: 2
-                    echo "Approved. Deploying to ${envName}..."
+                    echo "Approved. Deploying to ${params.ENVIRONMENT}..."
                 }
             }
         }
 
         // ─────────────────────────────────────────────
-        // STAGE 11: Deploy to Staging — direct kubectl
+        // STAGE 11: Deploy to Staging
         // ─────────────────────────────────────────────
         stage('Deploy to Staging') {
             when {
@@ -331,12 +327,10 @@ pipeline {
             }
             steps {
                 script {
-                    def ver = params.VERSION
-                    def svc = SERVICE
-                    echo "=== Deploying to Staging — version: ${ver} ==="
+                    echo "=== Deploying to Staging — version: ${params.VERSION} ==="
                     sh """
                         kubectl set image deployment/attendance-blue \
-                            ${svc}=${svc}:${ver} \
+                            ${SERVICE}=${SERVICE}:${params.VERSION} \
                             --namespace=staging
                         kubectl rollout status deployment/attendance-blue \
                             --namespace=staging --timeout=120s
@@ -347,7 +341,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // STAGE 12: Test Staging — health check via pod exec
+        // STAGE 12: Test Staging — health check
+        //   ✅ Fixed: port=8081, path=/attendance/healthz
+        //   Label: app=attendance,slot=blue
         // ─────────────────────────────────────────────
         stage('Test Staging') {
             when {
@@ -358,36 +354,27 @@ pipeline {
             }
             steps {
                 script {
-                    echo "=== Staging Health Check ==="
+                    echo "=== Staging Health Check (port: ${HEALTH_PORT}, path: ${HEALTH_PATH}) ==="
                     sleep(time: 15, unit: 'SECONDS')
                     def result = sh(
-                        script: '''
-                            POD=$(kubectl get pod -n staging \
-                                -l app=attendance \
+                        script: """
+                            POD=\$(kubectl get pod -n staging \
+                                -l app=attendance,slot=blue \
                                 --field-selector=status.phase=Running \
                                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-                            if [ -z "$POD" ]; then
-                                echo "WARNING: No running pod found in staging namespace"
+                            if [ -z "\$POD" ]; then
+                                echo "WARNING: No running pod found in staging"
                                 exit 0
                             fi
-                            echo "Checking pod: $POD"
-                            for PORT in 5000 8080 80 3000 8000; do
-                                echo "Trying port $PORT..."
-                                if kubectl exec -n staging "$POD" -- \
-                                    curl -sf --connect-timeout 5 \
-                                    "http://localhost:$PORT/health" > /dev/null 2>&1; then
-                                    echo "Health check PASSED on port $PORT"
-                                    exit 0
-                                fi
-                                echo "Port $PORT did not respond"
-                            done
-                            echo "Health check: no port responded, marking UNSTABLE"
-                            exit 1
-                        ''',
+                            echo "Checking pod: \$POD"
+                            kubectl exec -n staging "\$POD" -- \
+                                curl -sf --connect-timeout 10 \
+                                http://localhost:${HEALTH_PORT}${HEALTH_PATH}
+                        """,
                         returnStatus: true
                     )
                     if (result != 0) {
-                        echo "WARNING: Staging health check could not verify — marking UNSTABLE"
+                        echo "WARNING: Staging health check failed. Marking UNSTABLE."
                         currentBuild.result = 'UNSTABLE'
                     } else {
                         echo "Staging health check PASSED."
@@ -397,8 +384,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // STAGE 13: Blue-Green Deploy to Prod
-        //           Deploy new version to idle slot only
+        // STAGE 13: Blue-Green Deploy to Prod (idle slot)
+        //   Finds live slot → deploys to idle slot
+        //   Traffic NOT switched yet (Blue still live)
         // ─────────────────────────────────────────────
         stage('Deploy to Green (Prod Blue-Green)') {
             when {
@@ -410,12 +398,10 @@ pipeline {
             }
             steps {
                 script {
-                    def ver = params.VERSION
-                    def svc = SERVICE
                     echo "=== Blue-Green: Finding idle slot ==="
 
                     def liveSlot = sh(
-                        script: "kubectl get svc ${svc} -n prod -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo 'blue'",
+                        script: "kubectl get svc ${SERVICE} -n prod -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo 'blue'",
                         returnStdout: true
                     ).trim()
 
@@ -426,19 +412,21 @@ pipeline {
                     env.IDLE_SLOT = idleSlot
 
                     sh """
-                        kubectl set image deployment/${svc}-${idleSlot} \
-                            ${svc}=${svc}:${ver} \
+                        kubectl set image deployment/${SERVICE}-${idleSlot} \
+                            ${SERVICE}=${SERVICE}:${params.VERSION} \
                             -n prod
-                        kubectl rollout status deployment/${svc}-${idleSlot} \
+                        kubectl rollout status deployment/${SERVICE}-${idleSlot} \
                             -n prod --timeout=120s
                     """
-                    echo "Deployed ${ver} to ${idleSlot} slot."
+                    echo "Deployed ${params.VERSION} to ${idleSlot} slot. ${liveSlot} still serving traffic."
                 }
             }
         }
 
         // ─────────────────────────────────────────────
         // STAGE 14: Health Check — idle slot (5 retries)
+        //   ✅ Fixed: port=8081, path=/attendance/healthz
+        //   Label: app=attendance,slot=<idleSlot>
         // ─────────────────────────────────────────────
         stage('Health Check - Green Slot') {
             when {
@@ -450,8 +438,7 @@ pipeline {
             steps {
                 script {
                     def idleSlot = env.IDLE_SLOT
-                    def svc      = SERVICE
-                    echo "=== Health Check on slot: ${idleSlot} ==="
+                    echo "=== Health Check on idle slot: ${idleSlot} (port: ${HEALTH_PORT}, path: ${HEALTH_PATH}) ==="
                     sleep(time: 15, unit: 'SECONDS')
 
                     def passed = false
@@ -459,24 +446,17 @@ pipeline {
                         def result = sh(
                             script: """
                                 POD=\$(kubectl get pod -n prod \
-                                    -l app=${svc},slot=${idleSlot} \
+                                    -l app=${SERVICE},slot=${idleSlot} \
                                     --field-selector=status.phase=Running \
                                     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
                                 if [ -z "\$POD" ]; then
-                                    echo "Attempt ${i}: No pod found for slot ${idleSlot}"
+                                    echo "Attempt ${i}: No running pod for slot ${idleSlot}"
                                     exit 1
                                 fi
-                                echo "Attempt ${i}: checking pod \$POD"
-                                for PORT in 5000 8080 80 3000 8000; do
-                                    echo "Trying port \$PORT..."
-                                    if kubectl exec -n prod "\$POD" -- \
-                                        curl -sf --connect-timeout 5 \
-                                        "http://localhost:\$PORT/health" > /dev/null 2>&1; then
-                                        echo "Health check PASSED on port \$PORT"
-                                        exit 0
-                                    fi
-                                done
-                                exit 1
+                                echo "Attempt ${i}: Checking pod \$POD"
+                                kubectl exec -n prod "\$POD" -- \
+                                    curl -sf --connect-timeout 10 \
+                                    http://localhost:${HEALTH_PORT}${HEALTH_PATH}
                             """,
                             returnStatus: true
                         )
@@ -491,7 +471,7 @@ pipeline {
 
                     if (!passed) {
                         env.HEALTH_CHECK_FAILED = 'true'
-                        echo "WARNING: Health check FAILED after 5 attempts. Triggering rollback."
+                        echo "WARNING: Health check FAILED after 5 attempts. Will rollback."
                         currentBuild.result = 'UNSTABLE'
                     } else {
                         env.HEALTH_CHECK_FAILED = 'false'
@@ -503,6 +483,7 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // STAGE 15: Switch Traffic → idle slot goes live
+        //   Only runs if health check PASSED
         // ─────────────────────────────────────────────
         stage('Switch Traffic to Green') {
             when {
@@ -514,23 +495,20 @@ pipeline {
             }
             steps {
                 script {
-                    def liveSlot = env.LIVE_SLOT
-                    def idleSlot = env.IDLE_SLOT
-                    def svc      = SERVICE
-                    echo "=== Switching traffic: ${liveSlot} → ${idleSlot} ==="
+                    echo "=== Switching traffic: ${env.LIVE_SLOT} → ${env.IDLE_SLOT} ==="
                     sh """
-                        kubectl patch svc ${svc} -n prod \
+                        kubectl patch svc ${SERVICE} -n prod \
                             --type=json \
-                            -p '[{"op":"replace","path":"/spec/selector/slot","value":"${idleSlot}"}]'
+                            -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.IDLE_SLOT}"}]'
                     """
-                    echo "Traffic switched! ${idleSlot} is now LIVE. ${liveSlot} is standby."
+                    echo "Traffic switched! ${env.IDLE_SLOT} is now LIVE. ${env.LIVE_SLOT} is standby."
                 }
             }
         }
 
         // ─────────────────────────────────────────────
         // STAGE 16: Rollback
-        //           Manual (ROLLBACK=true) OR auto (health check failed)
+        //   Manual (ROLLBACK=true) OR auto (health check failed)
         // ─────────────────────────────────────────────
         stage('Rollback') {
             when {
@@ -541,28 +519,26 @@ pipeline {
             }
             steps {
                 script {
-                    def svc = SERVICE
                     if (params.ROLLBACK) {
                         def ns = params.ENVIRONMENT
                         echo "=== MANUAL ROLLBACK on ${ns} ==="
                         sh """
-                            LIVE=\$(kubectl get svc ${svc} -n ${ns} \
+                            LIVE=\$(kubectl get svc ${SERVICE} -n ${ns} \
                                 -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo 'blue')
                             PREV=\$([ "\$LIVE" = "blue" ] && echo "green" || echo "blue")
                             echo "Switching back to: \$PREV"
-                            kubectl patch svc ${svc} -n ${ns} \
+                            kubectl patch svc ${SERVICE} -n ${ns} \
                                 --type=json \
                                 -p '[{"op":"replace","path":"/spec/selector/slot","value":"'"\$PREV"'"}]'
                         """
                     } else {
-                        def liveSlot = env.LIVE_SLOT
-                        echo "=== AUTO ROLLBACK: keeping ${liveSlot} as live ==="
+                        echo "=== AUTO ROLLBACK: keeping ${env.LIVE_SLOT} as live ==="
                         sh """
-                            kubectl patch svc ${svc} -n prod \
+                            kubectl patch svc ${SERVICE} -n prod \
                                 --type=json \
-                                -p '[{"op":"replace","path":"/spec/selector/slot","value":"${liveSlot}"}]'
+                                -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.LIVE_SLOT}"}]'
                         """
-                        echo "Rollback done. ${liveSlot} is still serving traffic."
+                        echo "Rollback done. ${env.LIVE_SLOT} is still serving traffic."
                     }
                 }
             }
@@ -574,15 +550,24 @@ pipeline {
         stage('Final Status') {
             steps {
                 script {
-                    def ns  = params.ENVIRONMENT
-                    def svc = SERVICE
                     echo "=== FINAL STATUS ==="
-                    sh "kubectl get all -n ${ns} || true"
+                    sh "kubectl get all -n ${params.ENVIRONMENT} || true"
                     def liveSlot = sh(
-                        script: "kubectl get svc ${svc} -n ${ns} -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo 'N/A'",
+                        script: "kubectl get svc ${SERVICE} -n ${params.ENVIRONMENT} -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo 'N/A'",
                         returnStdout: true
                     ).trim()
-                    echo "=== LIVE SLOT: ${liveSlot} ==="
+                    def blueImg = sh(
+                        script: "kubectl get deployment ${SERVICE}-blue -n ${params.ENVIRONMENT} -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo 'N/A'",
+                        returnStdout: true
+                    ).trim()
+                    def greenImg = sh(
+                        script: "kubectl get deployment ${SERVICE}-green -n ${params.ENVIRONMENT} -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo 'N/A'",
+                        returnStdout: true
+                    ).trim()
+                    echo ""
+                    echo "=== LIVE SLOT  === ${liveSlot}"
+                    echo "=== BLUE  IMG  === ${blueImg}"
+                    echo "=== GREEN IMG  === ${greenImg}"
                 }
             }
         }
@@ -618,14 +603,13 @@ pipeline {
         failure {
             script {
                 echo "=== POST: FAILURE ==="
-                def svc = SERVICE
+                // Auto-rollback on prod failure — revert to last known live slot
                 if (params.ENVIRONMENT == 'prod' && env.LIVE_SLOT) {
-                    def liveSlot = env.LIVE_SLOT
-                    echo "=== PROD FAILURE: Auto-rollback to ${liveSlot} ==="
+                    echo "=== PROD FAILURE: Auto-rollback to ${env.LIVE_SLOT} ==="
                     sh """
-                        kubectl patch svc ${svc} -n prod \
+                        kubectl patch svc ${SERVICE} -n prod \
                             --type=json \
-                            -p '[{"op":"replace","path":"/spec/selector/slot","value":"${liveSlot}"}]' \
+                            -p '[{"op":"replace","path":"/spec/selector/slot","value":"${env.LIVE_SLOT}"}]' \
                             || true
                     """
                 }
@@ -691,8 +675,6 @@ def buildDetails() {
 def buildEmailBody(String status) {
     def color    = (status == 'SUCCESS') ? '#28a745' :
                    (status == 'FAILURE') ? '#dc3545' : '#ffc107'
-    def envName  = params.ENVIRONMENT
-    def ver      = params.VERSION
     def liveInfo = env.LIVE_SLOT ?: 'N/A'
     return """
 <!DOCTYPE html><html><body style="font-family:Arial,sans-serif;padding:20px;">
@@ -704,10 +686,10 @@ def buildEmailBody(String status) {
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Service</td>
     <td style="padding:8px;border:1px solid #ddd;">${SERVICE}</td></tr>
   <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Version</td>
-    <td style="padding:8px;border:1px solid #ddd;">${ver}</td></tr>
+    <td style="padding:8px;border:1px solid #ddd;">${params.VERSION}</td></tr>
   <tr style="background:#f2f2f2;">
     <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Environment</td>
-    <td style="padding:8px;border:1px solid #ddd;">${envName}</td></tr>
+    <td style="padding:8px;border:1px solid #ddd;">${params.ENVIRONMENT}</td></tr>
   <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Branch</td>
     <td style="padding:8px;border:1px solid #ddd;">${env.BRANCH}</td></tr>
   <tr style="background:#f2f2f2;">
